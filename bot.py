@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""WeatherEdge v2 — Polymarket Weather Trading Bot"""
+"""
+WeatherEdge v3 — Polymarket Weather Trading Bot
+Complete rebuild with verified resolution stations, dynamic market fetching,
+bracket-aware analysis, and clean UI.
+"""
 
-import os, io, json, math, asyncio, html, requests, requests.utils
+import os, io, re, json, math, asyncio, html, requests, requests.utils
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from dotenv import load_dotenv
 
 import matplotlib
@@ -22,289 +26,511 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 OW_KEY         = os.getenv("OPENWEATHER_KEY", "")
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_KEY", "")
 
-AIRPORTS = {
-    "KJFK": {"lat": 40.6413, "lon": -73.7781, "city": "New York",       "name": "JFK", "tz": "America/New_York"},
-    "KLAX": {"lat": 33.9425, "lon": -118.408,  "city": "Los Angeles",   "name": "LAX", "tz": "America/Los_Angeles"},
-    "KORD": {"lat": 41.9742, "lon": -87.9073,  "city": "Chicago",       "name": "ORD", "tz": "America/Chicago"},
-    "KATL": {"lat": 33.6407, "lon": -84.4277,  "city": "Atlanta",       "name": "ATL", "tz": "America/New_York"},
-    "KDFW": {"lat": 32.8998, "lon": -97.0403,  "city": "Dallas",        "name": "DFW", "tz": "America/Chicago"},
-    "KMIA": {"lat": 25.7959, "lon": -80.2870,  "city": "Miami",         "name": "MIA", "tz": "America/New_York"},
-    "KSEA": {"lat": 47.4502, "lon": -122.309,  "city": "Seattle",       "name": "SEA", "tz": "America/Los_Angeles"},
-    "KDEN": {"lat": 39.8561, "lon": -104.674,  "city": "Denver",        "name": "DEN", "tz": "America/Denver"},
-    "KBOS": {"lat": 42.3656, "lon": -71.0096,  "city": "Boston",        "name": "BOS", "tz": "America/New_York"},
-    "KSFO": {"lat": 37.6213, "lon": -122.379,  "city": "San Francisco", "name": "SFO", "tz": "America/Los_Angeles"},
+# ─────────────────────────────────────────────────────────────────────────────
+# CITY DATABASE
+# Keys = city slug as it appears in Polymarket event slugs
+# e.g. "highest-temperature-in-nyc-on-..." → key = "nyc"
+# confirmed = True  → resolution station verified directly from Polymarket rules
+# confirmed = False → high-confidence inference from standard airport codes
+# ─────────────────────────────────────────────────────────────────────────────
+CITY_DB: Dict[str, Dict] = {
+    # United States  (°F, 2°F brackets) ──────────────────────────────────────
+    "nyc":           {"display":"New York City",  "flag":"🇺🇸", "metar":"KLGA","station":"LaGuardia Airport",              "lat":40.7769,"lon":-73.8740,"tz":"America/New_York",    "unit":"F","ok":True },
+    "dallas":        {"display":"Dallas",          "flag":"🇺🇸", "metar":"KDAL","station":"Dallas Love Field",               "lat":32.8471,"lon":-96.8518,"tz":"America/Chicago",     "unit":"F","ok":True },
+    "chicago":       {"display":"Chicago",         "flag":"🇺🇸", "metar":"KORD","station":"O'Hare International",            "lat":41.9742,"lon":-87.9073,"tz":"America/Chicago",     "unit":"F","ok":True },
+    "miami":         {"display":"Miami",           "flag":"🇺🇸", "metar":"KMIA","station":"Miami International",             "lat":25.7959,"lon":-80.2870,"tz":"America/New_York",    "unit":"F","ok":True },
+    "los-angeles":   {"display":"Los Angeles",     "flag":"🇺🇸", "metar":"KLAX","station":"LAX International",               "lat":33.9425,"lon":-118.408,"tz":"America/Los_Angeles", "unit":"F","ok":True },
+    "seattle":       {"display":"Seattle",         "flag":"🇺🇸", "metar":"KSEA","station":"Seattle-Tacoma Intl",             "lat":47.4502,"lon":-122.309,"tz":"America/Los_Angeles", "unit":"F","ok":True },
+    "san-francisco": {"display":"San Francisco",   "flag":"🇺🇸", "metar":"KSFO","station":"SFO International",               "lat":37.6213,"lon":-122.379,"tz":"America/Los_Angeles", "unit":"F","ok":True },
+    "atlanta":       {"display":"Atlanta",         "flag":"🇺🇸", "metar":"KATL","station":"Hartsfield-Jackson",              "lat":33.6407,"lon":-84.4277,"tz":"America/New_York",    "unit":"F","ok":True },
+    "houston":       {"display":"Houston",         "flag":"🇺🇸", "metar":"KHOU","station":"Hobby Airport",                   "lat":29.6454,"lon":-95.2789,"tz":"America/Chicago",     "unit":"F","ok":True },
+    "denver":        {"display":"Denver",          "flag":"🇺🇸", "metar":"KBKF","station":"Buckley Space Force Base",        "lat":39.7168,"lon":-104.752,"tz":"America/Denver",      "unit":"F","ok":True },
+    "austin":        {"display":"Austin",          "flag":"🇺🇸", "metar":"KAUS","station":"Austin-Bergstrom Intl",           "lat":30.1975,"lon":-97.6664,"tz":"America/Chicago",     "unit":"F","ok":False},
+    # Europe  (°C, 1°C brackets) ──────────────────────────────────────────────
+    "london":        {"display":"London",          "flag":"🇬🇧", "metar":"EGLC","station":"London City Airport",             "lat":51.5048,"lon":  0.0495,"tz":"Europe/London",       "unit":"C","ok":True },
+    "paris":         {"display":"Paris",           "flag":"🇫🇷", "metar":"LFPB","station":"Paris-Le Bourget",                "lat":48.9694,"lon":  2.4411,"tz":"Europe/Paris",        "unit":"C","ok":True },
+    "amsterdam":     {"display":"Amsterdam",       "flag":"🇳🇱", "metar":"EHAM","station":"Amsterdam Schiphol",              "lat":52.3105,"lon":  4.7683,"tz":"Europe/Amsterdam",    "unit":"C","ok":True },
+    "madrid":        {"display":"Madrid",          "flag":"🇪🇸", "metar":"LEMD","station":"Adolfo Suárez Barajas",           "lat":40.4719,"lon": -3.5620,"tz":"Europe/Madrid",       "unit":"C","ok":True },
+    "munich":        {"display":"Munich",          "flag":"🇩🇪", "metar":"EDDM","station":"Munich Airport",                  "lat":48.3537,"lon": 11.7750,"tz":"Europe/Berlin",       "unit":"C","ok":True },
+    "istanbul":      {"display":"Istanbul",        "flag":"🇹🇷", "metar":"LTFM","station":"Istanbul Airport",                "lat":41.2753,"lon": 28.7519,"tz":"Europe/Istanbul",     "unit":"C","ok":True },
+    "warsaw":        {"display":"Warsaw",          "flag":"🇵🇱", "metar":"EPWA","station":"Warsaw Chopin Airport",           "lat":52.1657,"lon": 20.9671,"tz":"Europe/Warsaw",       "unit":"C","ok":True },
+    "milan":         {"display":"Milan",           "flag":"🇮🇹", "metar":"LIML","station":"Milan Linate Airport",            "lat":45.4654,"lon":  9.2768,"tz":"Europe/Rome",         "unit":"C","ok":False},
+    "helsinki":      {"display":"Helsinki",        "flag":"🇫🇮", "metar":"EFHK","station":"Helsinki-Vantaa Airport",         "lat":60.3172,"lon": 24.9633,"tz":"Europe/Helsinki",     "unit":"C","ok":False},
+    "moscow":        {"display":"Moscow",          "flag":"🇷🇺", "metar":"UUEE","station":"Sheremetyevo Airport",            "lat":55.9726,"lon": 37.4146,"tz":"Europe/Moscow",       "unit":"C","ok":False},
+    "ankara":        {"display":"Ankara",          "flag":"🇹🇷", "metar":"LTAE","station":"Esenboğa Airport",                "lat":40.1281,"lon": 32.9951,"tz":"Europe/Istanbul",     "unit":"C","ok":False},
+    # Asia-Pacific  (°C, 1°C brackets) ────────────────────────────────────────
+    "tokyo":         {"display":"Tokyo",           "flag":"🇯🇵", "metar":"RJTT","station":"Tokyo Haneda Airport",            "lat":35.5494,"lon":139.7798,"tz":"Asia/Tokyo",          "unit":"C","ok":True },
+    "seoul":         {"display":"Seoul",           "flag":"🇰🇷", "metar":"RKSI","station":"Incheon International",           "lat":37.4631,"lon":126.4400,"tz":"Asia/Seoul",          "unit":"C","ok":True },
+    "hong-kong":     {"display":"Hong Kong",       "flag":"🇭🇰", "metar":"VHHH","station":"HK International Airport",        "lat":22.3080,"lon":113.9185,"tz":"Asia/Hong_Kong",      "unit":"C","ok":True },
+    "taipei":        {"display":"Taipei",          "flag":"🇹🇼", "metar":"RCSS","station":"Taipei Songshan Airport",         "lat":25.0694,"lon":121.5522,"tz":"Asia/Taipei",         "unit":"C","ok":True },
+    "shanghai":      {"display":"Shanghai",        "flag":"🇨🇳", "metar":"ZSPD","station":"Shanghai Pudong Intl",            "lat":31.1443,"lon":121.8083,"tz":"Asia/Shanghai",       "unit":"C","ok":True },
+    "beijing":       {"display":"Beijing",         "flag":"🇨🇳", "metar":"ZBAA","station":"Beijing Capital Intl",            "lat":40.0801,"lon":116.5847,"tz":"Asia/Shanghai",       "unit":"C","ok":True },
+    "singapore":     {"display":"Singapore",       "flag":"🇸🇬", "metar":"WSSS","station":"Changi Airport",                  "lat": 1.3502,"lon":103.9940,"tz":"Asia/Singapore",      "unit":"C","ok":True },
+    "shenzhen":      {"display":"Shenzhen",        "flag":"🇨🇳", "metar":"ZGSZ","station":"Shenzhen Bao'an Intl",            "lat":22.6393,"lon":113.8107,"tz":"Asia/Shanghai",       "unit":"C","ok":True },
+    "busan":         {"display":"Busan",           "flag":"🇰🇷", "metar":"RKPK","station":"Gimhae International",            "lat":35.1795,"lon":128.9383,"tz":"Asia/Seoul",          "unit":"C","ok":False},
+    "chongqing":     {"display":"Chongqing",       "flag":"🇨🇳", "metar":"ZUCK","station":"Chongqing Jiangbei Intl",         "lat":29.7192,"lon":106.6414,"tz":"Asia/Shanghai",       "unit":"C","ok":False},
+    "wuhan":         {"display":"Wuhan",           "flag":"🇨🇳", "metar":"ZHHH","station":"Wuhan Tianhe Intl",               "lat":30.7839,"lon":114.2080,"tz":"Asia/Shanghai",       "unit":"C","ok":False},
+    "chengdu":       {"display":"Chengdu",         "flag":"🇨🇳", "metar":"ZUUU","station":"Chengdu Shuangliu Intl",          "lat":30.5784,"lon":103.9473,"tz":"Asia/Shanghai",       "unit":"C","ok":False},
+    "guangzhou":     {"display":"Guangzhou",       "flag":"🇨🇳", "metar":"ZGGG","station":"Guangzhou Baiyun Intl",           "lat":23.3924,"lon":113.2990,"tz":"Asia/Shanghai",       "unit":"C","ok":False},
+    "qingdao":       {"display":"Qingdao",         "flag":"🇨🇳", "metar":"ZSQD","station":"Qingdao Jiaodong Intl",           "lat":36.2661,"lon":120.3742,"tz":"Asia/Shanghai",       "unit":"C","ok":False},
+    "jakarta":       {"display":"Jakarta",         "flag":"🇮🇩", "metar":"WIII","station":"Soekarno-Hatta Intl",             "lat":-6.1257,"lon":106.6556,"tz":"Asia/Jakarta",        "unit":"C","ok":False},
+    "kuala-lumpur":  {"display":"Kuala Lumpur",    "flag":"🇲🇾", "metar":"WMKK","station":"KLIA",                             "lat": 2.7456,"lon":101.7099,"tz":"Asia/Kuala_Lumpur",   "unit":"C","ok":False},
+    "manila":        {"display":"Manila",          "flag":"🇵🇭", "metar":"RPLL","station":"Ninoy Aquino Intl",                "lat":14.5086,"lon":121.0197,"tz":"Asia/Manila",         "unit":"C","ok":False},
+    "lucknow":       {"display":"Lucknow",         "flag":"🇮🇳", "metar":"VILK","station":"Chaudhary Charan Singh Intl",     "lat":26.7606,"lon": 80.8893,"tz":"Asia/Kolkata",        "unit":"C","ok":False},
+    "jeddah":        {"display":"Jeddah",          "flag":"🇸🇦", "metar":"OEJN","station":"King Abdulaziz Intl",             "lat":21.6796,"lon": 39.1564,"tz":"Asia/Riyadh",         "unit":"C","ok":False},
+    "karachi":       {"display":"Karachi",         "flag":"🇵🇰", "metar":"OPKC","station":"Jinnah International",            "lat":24.9008,"lon": 67.1681,"tz":"Asia/Karachi",        "unit":"C","ok":False},
+    "tel-aviv":      {"display":"Tel Aviv",        "flag":"🇮🇱", "metar":"LLBG","station":"Ben Gurion Airport",              "lat":32.0114,"lon": 34.8867,"tz":"Asia/Jerusalem",      "unit":"C","ok":False},
+    # Americas & Oceania ──────────────────────────────────────────────────────
+    "toronto":       {"display":"Toronto",         "flag":"🇨🇦", "metar":"CYYZ","station":"Pearson International",           "lat":43.6772,"lon": -79.631,"tz":"America/Toronto",     "unit":"C","ok":True },
+    "wellington":    {"display":"Wellington",      "flag":"🇳🇿", "metar":"NZWN","station":"Wellington International",        "lat":-41.327,"lon":174.8052,"tz":"Pacific/Auckland",    "unit":"C","ok":True },
+    "buenos-aires":  {"display":"Buenos Aires",    "flag":"🇦🇷", "metar":"SAEZ","station":"Ministro Pistarini Intl",         "lat":-34.822,"lon": -58.536,"tz":"America/Argentina/Buenos_Aires","unit":"C","ok":True },
+    "mexico-city":   {"display":"Mexico City",     "flag":"🇲🇽", "metar":"MMMX","station":"Benito Juárez Intl",              "lat":19.4363,"lon": -99.072,"tz":"America/Mexico_City", "unit":"C","ok":False},
+    "sao-paulo":     {"display":"Sao Paulo",       "flag":"🇧🇷", "metar":"SBSP","station":"Congonhas Airport",               "lat":-23.627,"lon": -46.657,"tz":"America/Sao_Paulo",   "unit":"C","ok":False},
+    "panama-city":   {"display":"Panama City",     "flag":"🇵🇦", "metar":"MPTO","station":"Tocumen International",           "lat": 9.0714,"lon": -79.384,"tz":"America/Panama",      "unit":"C","ok":False},
+    # Africa ──────────────────────────────────────────────────────────────────
+    "lagos":         {"display":"Lagos",           "flag":"🇳🇬", "metar":"DNMM","station":"Murtala Muhammed Intl",           "lat": 6.5774,"lon":  3.3212,"tz":"Africa/Lagos",         "unit":"C","ok":False},
+    "cape-town":     {"display":"Cape Town",       "flag":"🇿🇦", "metar":"FACT","station":"Cape Town International",         "lat":-33.965,"lon": 18.6017,"tz":"Africa/Johannesburg",  "unit":"C","ok":False},
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# USER STATE
+# ─────────────────────────────────────────────────────────────────────────────
 user_states: Dict[int, Dict] = {}
 
 def get_state(cid: int) -> Dict:
     if cid not in user_states:
         user_states[cid] = {
-            "airport": "KJFK", "day_offset": 1,
-            "market_type": "high", "unit": "F",
-            "budget": 30.0, "stop_loss": 50,
-            "center_override": None, "mkt_prices": {},
-            "data": {"hrrr": None, "ecmwf": None, "ow": None, "metar": None},
-            "poly": None,
+            "active":       None,   # dict: city_key, market_type, target_date, poly_brackets
+            "budget":       30.0,
+            "stop_loss":    50,
+            "center_override": None,
+            "mkt_prices":   {},     # {bracket_label: yes_price}
+            "data":         {"hrrr":None,"ecmwf":None,"ow":None,"metar":None},
+            "markets_page": 0,
+            "cached_events":None,
         }
     return user_states[cid]
 
-# ── Formatting ───────────────────────────────────────────────────────────────
-def b(s):   return "<b>" + str(s) + "</b>"
-def it(s):  return "<i>" + str(s) + "</i>"
-def c(s):   return "<code>" + html.escape(str(s)) + "</code>"
-def pre(s): return "<pre>" + html.escape(str(s)) + "</pre>"
-def esc(s): return html.escape(str(s))
+# ─────────────────────────────────────────────────────────────────────────────
+# FORMATTING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def b(s):    return "<b>" + str(s) + "</b>"
+def it(s):   return "<i>" + str(s) + "</i>"
+def c(s):    return "<code>" + html.escape(str(s)) + "</code>"
+def esc(s):  return html.escape(str(s))
 
-DIV  = "━" * 26
-SDIV = "─" * 26
+DIV  = "━" * 28
+SDIV = "─" * 28
 
-def bar(val, mx=100, w=12):
-    f = max(0, min(w, round(val / mx * w)))
+def bar(v, mx=100, w=12):
+    f = max(0, min(w, round(v / mx * w)))
     return "█" * f + "░" * (w - f)
 
 def conf_icon(score):
     return "🟢" if score >= 70 else "🟡" if score >= 45 else "🔴"
 
-def window_label(h):
-    if h > 60: return "🌐 EARLY  — ECMWF dominant"
-    if h > 36: return "📡 MID    — HRRR rising"
-    if h > 12: return "🎯 LATE   — HRRR + METAR"
-    return              "🔴 FINAL  — manage only"
+def day_label(dt: datetime) -> str:
+    today = datetime.now().date()
+    d = dt.date()
+    if d == today:              return "Today"
+    if d == today + timedelta(1): return "Tomorrow"
+    return dt.strftime("%b %-d")
 
-def day_label(d):
-    return "Today" if d == 0 else "Tomorrow" if d == 1 else "+{} Days".format(d)
+def hours_left_to(target_date: datetime) -> float:
+    eod = target_date.replace(hour=23, minute=59, second=0, microsecond=0)
+    return max(0.0, (eod - datetime.now()).total_seconds() / 3600)
 
-# ── Math ─────────────────────────────────────────────────────────────────────
-def c_to_f(cv): return round(cv * 9/5 + 32, 2)
+def hours_label(h: float) -> str:
+    if h < 1:   return "<1h"
+    if h < 24:  return f"{h:.0f}h"
+    return f"{h/24:.1f}d"
 
-def std_dev(arr):
+def get_weights(h: float) -> Dict[str, float]:
+    if h >= 60: return {"ecmwf":0.50,"hrrr":0.20,"ow":0.25,"metar":0.05}
+    if h >= 36: return {"ecmwf":0.40,"hrrr":0.30,"ow":0.20,"metar":0.10}
+    if h >= 24: return {"ecmwf":0.25,"hrrr":0.45,"ow":0.15,"metar":0.15}
+    if h >= 12: return {"ecmwf":0.10,"hrrr":0.40,"ow":0.15,"metar":0.35}
+    return             {"ecmwf":0.05,"hrrr":0.30,"ow":0.10,"metar":0.55}
+
+def window_label(h: float) -> str:
+    if h > 60: return "🌐 Early  — ECMWF dominant"
+    if h > 36: return "📡 Mid    — HRRR rising"
+    if h > 12: return "🎯 Late   — HRRR + METAR"
+    return             "🔴 Final  — hold / manage"
+
+def std_dev(arr: list) -> float:
     if len(arr) < 2: return 0.0
-    m = sum(arr) / len(arr)
-    return math.sqrt(sum((v - m) ** 2 for v in arr) / len(arr))
+    m = sum(arr)/len(arr)
+    return math.sqrt(sum((v-m)**2 for v in arr)/len(arr))
 
-def hours_left(day_offset):
-    now = datetime.now()
-    target = (now + timedelta(days=day_offset)).replace(hour=23, minute=59, second=0, microsecond=0)
-    return max(0.0, (target - now).total_seconds() / 3600)
+def c_to_f(c_: float) -> float: return round(c_ * 9/5 + 32, 2)
 
-def get_weights(h):
-    if h >= 60: return {"ecmwf": 0.50, "hrrr": 0.20, "ow": 0.25, "metar": 0.05}
-    if h >= 36: return {"ecmwf": 0.40, "hrrr": 0.30, "ow": 0.20, "metar": 0.10}
-    if h >= 24: return {"ecmwf": 0.25, "hrrr": 0.45, "ow": 0.15, "metar": 0.15}
-    if h >= 12: return {"ecmwf": 0.10, "hrrr": 0.40, "ow": 0.15, "metar": 0.35}
-    return             {"ecmwf": 0.05, "hrrr": 0.30, "ow": 0.10, "metar": 0.55}
+# ─────────────────────────────────────────────────────────────────────────────
+# BRACKET PARSING
+# ─────────────────────────────────────────────────────────────────────────────
+INF = float("inf")
 
-# ── Fetchers ─────────────────────────────────────────────────────────────────
-def fetch_hrrr(state):
-    apt = AIRPORTS[state["airport"]]
-    t_unit = "fahrenheit" if state["unit"] == "F" else "celsius"
-    for model in ["hrrr_conus", "gfs_seamless"]:
-        try:
-            url = ("https://api.open-meteo.com/v1/forecast"
-                   "?latitude={}&longitude={}"
-                   "&daily=temperature_2m_max,temperature_2m_min"
-                   "&temperature_unit={}&models={}&forecast_days=4&timezone={}").format(
-                   apt["lat"], apt["lon"], t_unit, model, apt["tz"])
-            d = requests.get(url, timeout=15).json()
-            if "error" not in d:
-                d["daily"]["_model"] = model
-                return d["daily"]
-        except Exception:
-            pass
+def parse_bracket(label: str) -> Optional[Tuple[float, float]]:
+    """Parse a bracket label into (lo, hi) inclusive whole-degree range."""
+    s = label.strip()
+    # "68-69°F" or "68-69°C"
+    m = re.match(r'^(-?\d+)-(-?\d+)°[FC]$', s)
+    if m: return (float(m.group(1)), float(m.group(2)))
+    # "22°C" or "68°F"
+    m = re.match(r'^(-?\d+)°[FC]$', s)
+    if m: v = float(m.group(1)); return (v, v)
+    # "42°F or higher" / "42°C or higher"
+    m = re.match(r'^(-?\d+)°[FC]\s+or\s+higher$', s, re.I)
+    if m: return (float(m.group(1)), INF)
+    # "23°F or below"
+    m = re.match(r'^(-?\d+)°[FC]\s+or\s+below$', s, re.I)
+    if m: return (-INF, float(m.group(1)))
     return None
 
-def fetch_ecmwf(state):
-    apt = AIRPORTS[state["airport"]]
-    t_unit = "fahrenheit" if state["unit"] == "F" else "celsius"
-    try:
-        url = ("https://ensemble-api.open-meteo.com/v1/ensemble"
-               "?latitude={}&longitude={}"
-               "&daily=temperature_2m_max,temperature_2m_min"
-               "&temperature_unit={}&models=ecmwf_ifs04&forecast_days=4&timezone={}").format(
-               apt["lat"], apt["lon"], t_unit, apt["tz"])
-        d = requests.get(url, timeout=25).json()
-        return d["daily"] if "error" not in d else None
-    except Exception:
-        return None
+def bracket_center(lo: float, hi: float) -> float:
+    """Midpoint of a bracket (handles ±inf tails)."""
+    if lo == -INF: return hi - 2
+    if hi == INF:  return lo + 2
+    return (lo + hi) / 2
 
-def fetch_ow(state):
-    if not OW_KEY: return None
-    apt = AIRPORTS[state["airport"]]
-    units = "imperial" if state["unit"] == "F" else "metric"
-    try:
-        url = ("https://api.openweathermap.org/data/2.5/forecast"
-               "?lat={}&lon={}&appid={}&units={}&cnt=40").format(
-               apt["lat"], apt["lon"], OW_KEY, units)
-        d = requests.get(url, timeout=10).json()
-        return d if d.get("cod") in (200, "200") else None
-    except Exception:
-        return None
+def bracket_prob(members: list, lo: float, hi: float) -> float:
+    """Fraction of ECMWF members that round to a whole degree in [lo, hi]."""
+    if not members: return 0.0
+    count = sum(1 for m in members if lo <= round(m) <= hi)
+    return count / len(members)
 
-def fetch_metar(state):
-    try:
-        url = "https://aviationweather.gov/api/data/metar?ids={}&format=json&taf=false&hours=3".format(
-              state["airport"])
-        d = requests.get(url, timeout=10).json()
-        return d if isinstance(d, list) else None
-    except Exception:
-        return None
+# ─────────────────────────────────────────────────────────────────────────────
+# POLYMARKET API
+# ─────────────────────────────────────────────────────────────────────────────
+MONTH_MAP = {
+    "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+    "july":7,"august":8,"september":9,"october":10,"november":11,"december":12
+}
 
-def fetch_poly(state):
-    apt = AIRPORTS[state["airport"]]
+def parse_event_slug(slug: str) -> Optional[Dict]:
+    """Extract type / city_key / date from a Polymarket event slug."""
+    m = re.match(
+        r'^(highest|lowest)-temperature-in-(.+)-on-(\w+)-(\d+)-(\d+)$', slug
+    )
+    if not m: return None
+    month_name = m.group(3).lower()
+    month_num  = MONTH_MAP.get(month_name)
+    if not month_num: return None
     try:
-        kw = "{} temperature".format(apt["city"])
-        url = ("https://gamma-api.polymarket.com/markets"
-               "?active=true&closed=false&limit=50&keyword={}").format(
-               requests.utils.quote(kw))
-        d = requests.get(url, timeout=10).json()
-        return d if isinstance(d, list) else d.get("data", [])
-    except Exception:
+        target = datetime(int(m.group(5)), month_num, int(m.group(4)))
+    except ValueError:
         return None
-
-def fetch_all(state):
-    state["data"]["hrrr"]  = fetch_hrrr(state)
-    state["data"]["ecmwf"] = fetch_ecmwf(state)
-    state["data"]["metar"] = fetch_metar(state)
-    state["data"]["ow"]    = fetch_ow(state)
-    state["poly"]          = fetch_poly(state)
     return {
-        "HRRR":        "✅" if state["data"]["hrrr"]  else "❌",
-        "ECMWF":       "✅" if state["data"]["ecmwf"] else "❌",
-        "METAR":       "✅" if state["data"]["metar"] else "❌",
-        "OpenWeather": "✅" if state["data"]["ow"]    else ("⚠️" if not OW_KEY else "❌"),
-        "Polymarket":  "✅" if state["poly"]           else "❌",
+        "market_type": m.group(1),   # "highest" / "lowest"
+        "city_key":    m.group(2),   # "nyc", "los-angeles", etc.
+        "target_date": target,
     }
 
-# ── Processing ────────────────────────────────────────────────────────────────
-def hrrr_temp(state):
-    d = state["data"]["hrrr"]
-    if not d: return None
-    key  = "temperature_2m_max" if state["market_type"] == "high" else "temperature_2m_min"
-    vals = d.get(key, [])
-    idx  = state["day_offset"]
-    return float(vals[idx]) if idx < len(vals) and vals[idx] is not None else None
+def parse_brackets_from_markets(markets: list) -> List[Dict]:
+    """
+    Extract bracket info from a list of Polymarket market objects.
+    Returns list of {label, lo, hi, yes_price, no_price, volume}
+    """
+    out = []
+    for mk in markets:
+        label = (mk.get("question") or mk.get("title") or "").strip()
+        parsed = parse_bracket(label)
+        if not parsed: continue
+        lo, hi = parsed
+        prices_raw = mk.get("outcomePrices","[]")
+        try: prices = json.loads(prices_raw) if isinstance(prices_raw,str) else (prices_raw or [])
+        except: prices = []
+        yes_p = float(prices[0]) if prices else None
+        vol   = float(mk.get("volume") or mk.get("volumeNum") or 0)
+        out.append({"label":label,"lo":lo,"hi":hi,"yes_price":yes_p,"volume":vol})
+    # Sort by lo (ascending), putting tail brackets at ends
+    out.sort(key=lambda x: (-INF if x["lo"]==-INF else x["lo"]))
+    return out
 
-def ecmwf_ens(state):
-    d = state["data"]["ecmwf"]
+def fetch_poly_events() -> List[Dict]:
+    """Fetch all active temperature events from Polymarket Gamma API."""
+    all_events = []
+    seen = set()
+    endpoints = [
+        "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=300&tag_slug=weather",
+        "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=300&tag_slug=temperature",
+    ]
+    for url in endpoints:
+        try:
+            r = requests.get(url, timeout=15)
+            items = r.json() if isinstance(r.json(), list) else r.json().get("data",[])
+            for ev in items:
+                eid = ev.get("id") or ev.get("slug","")
+                if eid in seen: continue
+                slug = ev.get("slug","")
+                parsed = parse_event_slug(slug)
+                if not parsed: continue
+                parsed["id"]       = eid
+                parsed["slug"]     = slug
+                parsed["title"]    = ev.get("title","")
+                parsed["volume"]   = float(ev.get("volume") or ev.get("volumeNum") or 0)
+                parsed["liquidity"]= float(ev.get("liquidity") or 0)
+                parsed["end_date"] = ev.get("endDate") or ev.get("endDateIso")
+                parsed["brackets"] = parse_brackets_from_markets(ev.get("markets") or [])
+                seen.add(eid)
+                all_events.append(parsed)
+        except Exception:
+            pass
+    # Sort: soonest first, then by volume descending
+    all_events.sort(key=lambda e: (e["target_date"], -e["volume"]))
+    return all_events
+
+def group_events_by_date(events: List[Dict]) -> Dict[str, List[Dict]]:
+    """Group events by date label."""
+    groups: Dict[str, List[Dict]] = {}
+    for ev in events:
+        label = day_label(ev["target_date"])
+        groups.setdefault(label, []).append(ev)
+    return groups
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEATHER FETCHERS
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch_hrrr(city: Dict, target_date: datetime, unit: str) -> Optional[Dict]:
+    t_unit = "fahrenheit" if unit=="F" else "celsius"
+    for model in ["hrrr_conus","gfs_seamless"]:
+        try:
+            url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={city['lat']}&longitude={city['lon']}"
+                f"&daily=temperature_2m_max,temperature_2m_min"
+                f"&temperature_unit={t_unit}&models={model}&forecast_days=7"
+                f"&timezone={city['tz']}"
+            )
+            d = requests.get(url,timeout=15).json()
+            if "error" not in d:
+                d["daily"]["_model"] = model
+                d["daily"]["_dates"] = d["daily"].get("time",[])
+                return d["daily"]
+        except Exception: pass
+    return None
+
+def fetch_ecmwf(city: Dict, target_date: datetime, unit: str) -> Optional[Dict]:
+    t_unit = "fahrenheit" if unit=="F" else "celsius"
+    try:
+        url = (
+            f"https://ensemble-api.open-meteo.com/v1/ensemble"
+            f"?latitude={city['lat']}&longitude={city['lon']}"
+            f"&daily=temperature_2m_max,temperature_2m_min"
+            f"&temperature_unit={t_unit}&models=ecmwf_ifs04&forecast_days=7"
+            f"&timezone={city['tz']}"
+        )
+        d = requests.get(url,timeout=25).json()
+        if "error" not in d:
+            d["daily"]["_dates"] = d["daily"].get("time",[])
+            return d["daily"]
+    except Exception: pass
+    return None
+
+def fetch_ow(city: Dict, target_date: datetime, unit: str) -> Optional[Dict]:
+    if not OW_KEY: return None
+    units = "imperial" if unit=="F" else "metric"
+    try:
+        url = (
+            f"https://api.openweathermap.org/data/2.5/forecast"
+            f"?lat={city['lat']}&lon={city['lon']}&appid={OW_KEY}"
+            f"&units={units}&cnt=40"
+        )
+        d = requests.get(url,timeout=10).json()
+        return d if d.get("cod") in (200,"200") else None
+    except Exception: return None
+
+def fetch_metar(metar_id: str) -> Optional[list]:
+    try:
+        url = f"https://aviationweather.gov/api/data/metar?ids={metar_id}&format=json&taf=false&hours=3"
+        d = requests.get(url,timeout=10).json()
+        return d if isinstance(d,list) else None
+    except Exception: return None
+
+def fetch_all_weather(city: Dict, target_date: datetime, unit: str, data_store: Dict) -> Dict[str,str]:
+    data_store["hrrr"]  = fetch_hrrr(city, target_date, unit)
+    data_store["ecmwf"] = fetch_ecmwf(city, target_date, unit)
+    data_store["ow"]    = fetch_ow(city, target_date, unit)
+    data_store["metar"] = fetch_metar(city["metar"])
+    return {
+        "HRRR":  "✅" if data_store["hrrr"]  else "❌",
+        "ECMWF": "✅" if data_store["ecmwf"] else "❌",
+        "OW":    "✅" if data_store["ow"]    else ("⚠️" if not OW_KEY else "❌"),
+        "METAR": "✅" if data_store["metar"] else "❌",
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
+def date_index(data: Optional[Dict], target_date: datetime) -> int:
+    """Find index of target_date in Open-Meteo daily data."""
+    if not data: return -1
+    dates = data.get("_dates",[])
+    target_str = target_date.strftime("%Y-%m-%d")
+    try: return dates.index(target_str)
+    except ValueError: return -1
+
+def extract_hrrr_temp(data_store: Dict, target_date: datetime, mtype: str) -> Optional[float]:
+    d = data_store.get("hrrr")
     if not d: return None
-    key  = "temperature_2m_max" if state["market_type"] == "high" else "temperature_2m_min"
-    idx  = state["day_offset"]
-    members = [float(d[k][idx]) for k in d
-               if k.startswith(key + "_member") and idx < len(d[k]) and d[k][idx] is not None]
+    idx = date_index(d, target_date)
+    if idx < 0: return None
+    key = "temperature_2m_max" if mtype=="highest" else "temperature_2m_min"
+    v = d.get(key,[])
+    return float(v[idx]) if idx < len(v) and v[idx] is not None else None
+
+def extract_ecmwf_ensemble(data_store: Dict, target_date: datetime, mtype: str) -> Optional[Dict]:
+    d = data_store.get("ecmwf")
+    if not d: return None
+    idx = date_index(d, target_date)
+    if idx < 0: return None
+    key = "temperature_2m_max" if mtype=="highest" else "temperature_2m_min"
+    members = [
+        float(d[k][idx]) for k in d
+        if k.startswith(key+"_member") and idx < len(d[k]) and d[k][idx] is not None
+    ]
     if not members: return None
-    mean = sum(members) / len(members)
-    return {"mean": mean, "std": std_dev(members), "members": members, "count": len(members)}
+    mean = sum(members)/len(members)
+    return {"mean":mean,"std":std_dev(members),"members":members,"count":len(members)}
 
-def ow_temp(state):
-    d = state["data"]["ow"]
+def extract_ow_temp(data_store: Dict, target_date: datetime, mtype: str) -> Optional[float]:
+    d = data_store.get("ow")
     if not d or "list" not in d: return None
-    ds    = (datetime.now() + timedelta(days=state["day_offset"])).strftime("%Y-%m-%d")
-    items = [i for i in d["list"] if i.get("dt_txt", "").startswith(ds)]
+    ds = target_date.strftime("%Y-%m-%d")
+    items = [i for i in d["list"] if i.get("dt_txt","").startswith(ds)]
     if not items: return None
     temps = [i["main"]["temp"] for i in items]
-    return max(temps) if state["market_type"] == "high" else min(temps)
+    return max(temps) if mtype=="highest" else min(temps)
 
-def metar_temp(state):
-    d = state["data"]["metar"]
-    if not isinstance(d, list) or not d: return None
+def extract_metar_temp(data_store: Dict, unit: str) -> Optional[float]:
+    d = data_store.get("metar")
+    if not isinstance(d,list) or not d: return None
     t = d[0].get("temp")
     if t is None: return None
-    return c_to_f(t) if state["unit"] == "F" else float(t)
+    return c_to_f(t) if unit=="F" else float(t)
 
-def build_consensus(state):
-    h  = hours_left(state["day_offset"])
-    w  = get_weights(h)
-    ht = hrrr_temp(state)
-    ed = ecmwf_ens(state)
-    ot = ow_temp(state)
-    mt = metar_temp(state) if state["day_offset"] == 0 else None
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSENSUS ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+def build_consensus(data_store: Dict, target_date: datetime, mtype: str,
+                    unit: str, city_key: str) -> Optional[Dict]:
+    h = hours_left_to(target_date)
+    w = get_weights(h)
+
+    ht = extract_hrrr_temp(data_store, target_date, mtype)
+    ed = extract_ecmwf_ensemble(data_store, target_date, mtype)
+    ot = extract_ow_temp(data_store, target_date, mtype)
+    # Only use METAR as anchor if we're analyzing today & it's within 12h
+    mt = extract_metar_temp(data_store, unit) if (
+        target_date.date() == datetime.now().date() and h <= 24
+    ) else None
 
     pts = []
-    if ht is not None: pts.append({"name": "HRRR",        "temp": ht,        "weight": w["hrrr"]})
-    if ed is not None: pts.append({"name": "ECMWF",       "temp": ed["mean"],"weight": w["ecmwf"], "std": ed["std"]})
-    if ot is not None: pts.append({"name": "OpenWeather", "temp": ot,        "weight": w["ow"]})
-    if mt is not None: pts.append({"name": "METAR",       "temp": mt,        "weight": w["metar"]})
+    if ht is not None: pts.append({"name":"HRRR",        "temp":ht,        "weight":w["hrrr"]})
+    if ed is not None: pts.append({"name":"ECMWF",       "temp":ed["mean"],"weight":w["ecmwf"],"std":ed["std"]})
+    if ot is not None: pts.append({"name":"OpenWeather", "temp":ot,        "weight":w["ow"]})
+    if mt is not None: pts.append({"name":"METAR",       "temp":mt,        "weight":w["metar"]})
     if not pts: return None
 
-    w_sum = sum(p["weight"] for p in pts)
-    temp  = sum(p["temp"] * p["weight"] for p in pts) / w_sum
-    ms    = std_dev([p["temp"] for p in pts])
-    es    = ed["std"] if ed else 0.0
-    conf  = max(10.0, min(95.0, 100 - ms * 12 - es * 8 - h * 0.25))
-    return {"temp": temp, "rounded": round(temp), "sources": pts,
-            "confidence": conf, "model_spread": ms, "ecmwf_spread": es,
-            "hours": h, "weights": w}
+    w_sum  = sum(p["weight"] for p in pts)
+    temp   = sum(p["temp"]*p["weight"] for p in pts) / w_sum
+    ms     = std_dev([p["temp"] for p in pts])
+    es     = ed["std"] if ed else 0.0
+    conf   = max(10.0, min(95.0, 100 - ms*12 - es*8 - h*0.25))
+    return {
+        "temp":temp, "sources":pts,
+        "confidence":conf, "model_spread":ms, "ecmwf_spread":es,
+        "hours":h, "weights":w, "ensemble":ed,
+    }
 
-def build_dist(state, con):
-    ed = ecmwf_ens(state)
-    if not ed or not con: return None
-    ctr = state["center_override"] or round(con["temp"])
-    buckets = {t: 0 for t in range(ctr - 8, ctr + 9)}
-    for m in ed["members"]:
-        r = round(m)
-        if r in buckets: buckets[r] += 1
-    total = len(ed["members"])
-    return [{"temp": t, "prob": cnt / total, "pct": round(cnt / total * 100, 1), "count": cnt}
-            for t, cnt in buckets.items()]
+def find_center_bracket(consensus: Dict, brackets: List[Dict]) -> int:
+    """Return index of bracket best matching the consensus temperature."""
+    t = consensus["temp"]
+    if not brackets: return 0
+    best_idx, best_dist = 0, float("inf")
+    for i, bk in enumerate(brackets):
+        lo, hi = bk["lo"], bk["hi"]
+        ctr = bracket_center(lo, hi)
+        # Check if temp falls inside bracket first (exact match preferred)
+        lo_eff = lo if lo != -INF else -9999
+        hi_eff = hi if hi != INF  else  9999
+        if lo_eff <= round(t) <= hi_eff:
+            return i
+        dist = abs(ctr - t)
+        if dist < best_dist:
+            best_dist, best_idx = dist, i
+    return best_idx
 
-def get_pos(state, con):
-    ctr = state["center_override"] or con["rounded"]
-    return [ctr - 1, ctr, ctr + 1]
+def enrich_brackets(brackets: List[Dict], consensus: Dict, mkt_prices: Dict) -> List[Dict]:
+    """Add ECMWF probability and edge to each bracket."""
+    ed = consensus.get("ensemble")
+    members = ed["members"] if ed else []
+    for bk in brackets:
+        bk["model_prob"] = bracket_prob(members, bk["lo"], bk["hi"]) if members else None
+        manual = mkt_prices.get(bk["label"])
+        bk["manual_price"] = float(manual) if manual else bk.get("yes_price")
+        mp = bk["model_prob"]
+        pp = bk["manual_price"]
+        bk["edge"] = (mp - pp) if (mp is not None and pp is not None) else None
+    return brackets
 
-# ── Chart ─────────────────────────────────────────────────────────────────────
-def make_chart(dist, positions, unit, apt_name, city, confidence, market_type):
-    BG, CARD  = "#0d1117", "#161b22"
-    MUTED     = "#8b949e"
+# ─────────────────────────────────────────────────────────────────────────────
+# CHART
+# ─────────────────────────────────────────────────────────────────────────────
+def make_chart(brackets: List[Dict], center_idx: int,
+               display: str, market_type: str, unit: str, confidence: float) -> io.BytesIO:
+    BG, CARD = "#0d1117", "#161b22"
+    MUTED, TEXT = "#8b949e", "#e6edf3"
+    ACCENT, SPINE, GRID = "#58a6ff", "#30363d", "#21262d"
     HIGHLIGHT = "#1f6feb"
-    TEXT      = "#e6edf3"
-    GRID      = "#21262d"
-    SPINE     = "#30363d"
-    ACCENT    = "#58a6ff"
 
-    temps = [d["temp"] for d in dist]
-    probs = [d["pct"]  for d in dist]
-    cols  = [HIGHLIGHT if t in positions else CARD for t in temps]
+    labels = [bk["label"] for bk in brackets]
+    model  = [bk.get("model_prob",0) or 0 for bk in brackets]
+    market = [bk.get("manual_price") for bk in brackets]
+    colors = [HIGHLIGHT if i==center_idx else (HIGHLIGHT+"88" if abs(i-center_idx)<=1 else CARD)
+              for i in range(len(brackets))]
 
-    fig, ax = plt.subplots(figsize=(10, 4.5))
+    x = range(len(labels))
+    fig, ax = plt.subplots(figsize=(max(10, len(brackets)*0.85), 4.8))
     fig.patch.set_facecolor(BG)
     ax.set_facecolor(BG)
 
-    bars = ax.bar(temps, probs, color=cols, edgecolor=BG, linewidth=0.8, width=0.85, zorder=3)
-    for bar_, t, p in zip(bars, temps, probs):
-        if t in positions and p >= 1.0:
-            ax.text(bar_.get_x() + bar_.get_width() / 2, bar_.get_height() + 0.25,
-                    "{:.1f}%".format(p), ha="center", va="bottom", fontsize=9,
+    bars = ax.bar(x, [m*100 for m in model], color=colors, edgecolor=BG, width=0.65, zorder=3, label="Model (ECMWF)")
+    # Overlay market price dots
+    mkt_x, mkt_y = [], []
+    for i, mp in enumerate(market):
+        if mp is not None:
+            mkt_x.append(i)
+            mkt_y.append(mp*100)
+    if mkt_x:
+        ax.scatter(mkt_x, mkt_y, color="#f0883e", zorder=5, s=60, label="Market price", marker="D")
+
+    # Labels on highlighted bars
+    for i, (bar_, m) in enumerate(zip(bars, model)):
+        if abs(i-center_idx) <= 1 and m*100 >= 1:
+            ax.text(bar_.get_x()+bar_.get_width()/2, bar_.get_height()+0.3,
+                    f"{m*100:.1f}%", ha="center", va="bottom", fontsize=8,
                     color=ACCENT, fontweight="bold", fontfamily="monospace")
 
-    for p in positions:
-        ax.axvline(p, color=ACCENT, linewidth=1.2, linestyle="--", alpha=0.5, zorder=2)
-
-    conf_bar_str = bar(confidence)
-    title_type = "High" if market_type == "high" else "Low"
-    ax.set_xlabel("Temperature (°{})".format(unit), color=MUTED, fontsize=11, labelpad=8)
-    ax.set_ylabel("Ensemble probability (%)", color=MUTED, fontsize=11, labelpad=8)
-    ax.set_title(
-        "ECMWF Ensemble  ·  {} {}  ·  Daily {}\nConfidence  {}  {}/100".format(
-            apt_name, city, title_type, conf_bar_str, round(confidence)),
-        color=TEXT, fontsize=11, pad=14, linespacing=1.6
-    )
-    ax.tick_params(colors=MUTED, labelsize=9)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v,_: f"{v:.0f}%"))
+    for sp in ["top","right"]: ax.spines[sp].set_visible(False)
     ax.spines["bottom"].set_color(SPINE)
     ax.spines["left"].set_color(SPINE)
-    ax.grid(axis="y", color=GRID, linewidth=0.8, zorder=0)
+    ax.grid(axis="y", color=GRID, linewidth=0.7, zorder=0)
     ax.set_axisbelow(True)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: "{:.0f}%".format(x)))
-
-    pos_label = "{}\u2013{}°{}".format(positions[0], positions[2], unit)
-    legend = [
-        mpatches.Patch(color=HIGHLIGHT, label="Recommended positions ({})".format(pos_label)),
-        mpatches.Patch(color=CARD,      label="Other buckets"),
-    ]
-    ax.legend(handles=legend, framealpha=0, labelcolor=MUTED, fontsize=9,
-              loc="upper right", borderpad=0)
+    ax.set_xlabel(f"Temperature bracket (°{unit})", color=MUTED, fontsize=10)
+    ax.set_ylabel("Probability (%)", color=MUTED, fontsize=10)
+    conf_bar = bar(confidence)
+    type_str = "High" if market_type == "highest" else "Low"
+    ax.set_title(
+        f"ECMWF Ensemble  ·  {display} Daily {type_str}\nConfidence  {conf_bar}  {confidence:.0f}/100",
+        color=TEXT, fontsize=11, pad=12, linespacing=1.6
+    )
+    if mkt_x:
+        ax.legend(framealpha=0, labelcolor=MUTED, fontsize=9, loc="upper right")
 
     plt.tight_layout(pad=1.5)
     buf = io.BytesIO()
@@ -313,315 +539,312 @@ def make_chart(dist, positions, unit, apt_name, city, confidence, market_type):
     buf.seek(0)
     return buf
 
-# ── Messages ──────────────────────────────────────────────────────────────────
-def msg_no_data():
-    return "\n".join([
-        b("⛅ WeatherEdge"), DIV, "",
-        "No data loaded yet.", "",
-        "Tap {} to pull from all sources.".format(b("🔄 Fetch All")),
-    ])
+# ─────────────────────────────────────────────────────────────────────────────
+# MESSAGE BUILDERS
+# ─────────────────────────────────────────────────────────────────────────────
+def msg_market_list(events: List[Dict], page: int = 0) -> str:
+    if not events:
+        return "\n".join([
+            b("🌡 Weather Markets"), DIV, "",
+            "No active temperature markets found right now.",
+            "Polymarket usually opens new markets at midnight ET.",
+        ])
 
-def msg_forecast(state):
-    con = build_consensus(state)
-    if not con:
-        return msg_no_data()
+    ITEMS_PER_PAGE = 12
+    grouped = group_events_by_date(events)
+    date_keys = list(grouped.keys())
 
-    apt  = AIRPORTS[state["airport"]]
-    unit = state["unit"]
-    h    = con["hours"]
-    dist = build_dist(state, con)
-    pos  = get_pos(state, con)
-    typ  = "High 🌡" if state["market_type"] == "high" else "Low ❄️"
-    w    = con["weights"]
+    # Flatten to pages
+    all_items = []
+    for dk in date_keys:
+        all_items.append(("__header__", dk))
+        for ev in grouped[dk]:
+            all_items.append(("event", ev))
 
-    # Header
-    header = "{apt} {city}".format(apt=apt["name"], city=apt["city"])
+    total = len([x for x in all_items if x[0]=="event"])
+    start = page * ITEMS_PER_PAGE
+    end   = start + ITEMS_PER_PAGE
+
+    # Slice events (keep headers)
+    event_count = 0
+    lines = [b("🌡 Polymarket Temperature Markets"), DIV]
+
+    current_header = None
+    shown = 0
+    for kind, item in all_items:
+        if kind == "__header__":
+            current_header = item
+            continue
+        event_count += 1
+        if event_count <= start: continue
+        if event_count > end: break
+
+        ev    = item
+        ck    = ev["city_key"]
+        city  = CITY_DB.get(ck)
+        flag  = city["flag"] if city else "🌍"
+        disp  = city["display"] if city else ck.replace("-"," ").title()
+        stn   = city["station"] if city else "unknown station"
+        ok    = city["ok"] if city else False
+        conf  = "✅" if ok else "⚠️"
+        h     = hours_left_to(ev["target_date"])
+        typ   = "🌡" if ev["market_type"]=="highest" else "❄️"
+        vol   = f"${ev['volume']/1000:.0f}K" if ev["volume"] >= 1000 else f"${ev['volume']:.0f}"
+
+        if current_header and shown == 0 or (event_count == start+1):
+            lines += ["", b(current_header), SDIV]
+            current_header = None
+
+        # Top bracket by yes_price
+        top_bk = ""
+        if ev["brackets"]:
+            best = max(ev["brackets"], key=lambda x: x.get("yes_price") or 0, default=None)
+            if best and best.get("yes_price"):
+                top_bk = f"  {esc(best['label'])} {best['yes_price']*100:.0f}¢"
+
+        lines.append(
+            f"{flag} {b(esc(disp))}"
+            f"  {it(esc(stn))} {conf}"
+            f"  {typ}  {hours_label(h)}"
+            f"  {vol}"
+            f"{top_bk}"
+        )
+        shown += 1
+
+    total_pages = math.ceil(len([x for x in all_items if x[0]=="event"]) / ITEMS_PER_PAGE)
+    lines += ["", it(f"Page {page+1}/{total_pages}  ·  {total} markets  ·  Tap a city to analyze")]
+    return "\n".join(lines)
+
+
+def msg_analysis(state: Dict, city: Dict, consensus: Dict,
+                 brackets: List[Dict], center_idx: int) -> str:
+    active = state["active"]
+    h      = consensus["hours"]
+    unit   = city["unit"]
+    conf   = consensus["confidence"]
+    typ    = "Daily High 🌡" if active["market_type"]=="highest" else "Daily Low ❄️"
+    ok_str = "✅ verified" if city["ok"] else "⚠️ unconfirmed"
+
     lines = [
-        b("⛅ WeatherEdge") + "  ·  " + b(esc(header)),
+        b("⛅ WeatherEdge Analysis"),
         DIV,
-        "📅  " + b(day_label(state["day_offset"])) + "  ·  Daily " + typ + "  ·  " + b("{:.0f}h".format(h)) + " to resolve",
-        "🔲  " + window_label(h),
-        "",
+        f"{city['flag']}  {b(esc(city['display']))}  ·  {typ}",
+        f"📍  {esc(city['station'])} ({city['metar']})  {ok_str}",
+        f"📅  {day_label(active['target_date'])}  ·  ⏱ {hours_label(h)} left",
     ]
 
-    # Model table
-    lines.append(b("📊  Model Consensus"))
-    lines.append(SDIV)
+    if not city["ok"]:
+        lines += [
+            "",
+            "⚠️ " + it("Resolution station not yet confirmed from Polymarket rules."),
+            it("Verify at polymarket.com before trading."),
+        ]
 
-    w_sum = sum(p["weight"] for p in con["sources"])
+    # ── Consensus ──
+    lines += ["", b("Consensus"), SDIV]
+    w_sum = sum(p["weight"] for p in consensus["sources"])
     rows  = []
-    for s in con["sources"]:
-        wt_pct  = round(s["weight"] / w_sum * 100)
-        spread  = "±{:.1f}°".format(s["std"]) if s.get("std") else "     "
-        bar_str = bar(wt_pct, 100, 8)
-        rows.append("{:<12} {:>5.1f}° {:<6}  {}  {:>3}%".format(
-            s["name"], s["temp"], spread, bar_str, wt_pct))
-    rows.append("─" * 42)
-    rows.append("{:<12} {:>5.1f}°".format("Consensus", con["temp"]))
-    lines.append(pre("\n".join(rows)))
-    lines.append("")
+    for s in consensus["sources"]:
+        wt  = round(s["weight"]/w_sum*100)
+        sd  = f"±{s['std']:.1f}°" if s.get("std") else "      "
+        rows.append(f"  {s['name']:<13} {s['temp']:>5.1f}°  {sd:<7}  {wt:>3}%")
+    rows.append("  " + "─"*38)
+    rows.append(f"  {'Consensus':<13} {consensus['temp']:>5.1f}°")
+    lines.append(c("\n".join(rows)))
 
-    # Confidence
-    score    = con["confidence"]
-    bar_str  = bar(score)
-    conf_row = "{} {:.0f}/100   spread ±{:.1f}°  ECMWF ±{:.1f}°".format(
-               bar_str, score, con["model_spread"], con["ecmwf_spread"])
+    # ── Confidence ──
     lines += [
-        b("{} Confidence  {:.0f}/100".format(conf_icon(score), score)),
-        c(conf_row),
         "",
+        b(f"{conf_icon(conf)}  Confidence  {conf:.0f} / 100"),
+        c(f"  {bar(conf)}  {conf:.0f}/100"
+          f"  spread ±{consensus['model_spread']:.1f}°"
+          f"  ECMWF ±{consensus['ecmwf_spread']:.1f}°"
+          f"  {h:.0f}h lead"),
+        c(f"  {window_label(h)}"),
+    ]
+
+    # ── Brackets ──
+    if brackets:
+        lines += ["", b("3-Position Entry"), SDIV]
+        alloc = state["budget"] / 3
+        pos_rows = []
+        for i, bk in enumerate(brackets):
+            dist = abs(i - center_idx)
+            if dist > 1: continue
+            tag    = "⭐" if i==center_idx else "  "
+            ctr_lbl= "  ← center" if i==center_idx else ""
+            mp_str = f"  mkt {bk['manual_price']*100:.0f}¢" if bk.get("manual_price") else ""
+            ed_str = ""
+            if bk.get("edge") is not None:
+                sign = "+" if bk["edge"] >= 0 else ""
+                ed_str = f"  edge {sign}{bk['edge']*100:.1f}%"
+            model_str = f"{bk['model_prob']*100:.1f}%" if bk.get("model_prob") is not None else " — "
+            pos_rows.append(
+                f"  {tag} {bk['label']:<11}  {model_str:>6}{mp_str}{ed_str}{ctr_lbl}"
+            )
+        pos_rows.append("  " + "─"*38)
+        pos_rows.append(f"  Budget ${state['budget']:.2f}  ·  ${alloc:.2f}/bracket  ·  stop {state['stop_loss']}%")
+        lines.append(c("\n".join(pos_rows)))
+
+        # Market volume
+        vol  = active.get("event_volume", 0)
+        liq  = active.get("event_liquidity", 0)
+        if vol:
+            vol_str = f"${vol/1000:.0f}K vol" if vol >= 1000 else f"${vol:.0f}"
+            liq_str = f"  ·  ${liq/1000:.0f}K liq" if liq >= 1000 else ""
+            lines += ["", it(f"Market  {vol_str}{liq_str}")]
+
+    return "\n".join(lines)
+
+
+def msg_strategy(state: Dict, city: Dict, brackets: List[Dict], center_idx: int,
+                 consensus: Dict) -> str:
+    active = state["active"]
+    h      = consensus["hours"]
+    unit   = city["unit"]
+    typ    = "High" if active["market_type"]=="highest" else "Low"
+    alloc  = state["budget"] / 3
+
+    lines = [
+        b(f"💡 Strategy  ·  {esc(city['display'])} Daily {typ}"),
+        b(f"   {day_label(active['target_date'])}"),
+        DIV,
     ]
 
     # Positions
-    lines.append(b("📦  3-Position Entry  ({})".format(unit)))
+    lines.append(b("📦  3-Position Entry Plan"))
     lines.append(SDIV)
-
     pos_rows = []
-    for idx, p in enumerate(pos):
-        model_pct = next((d["pct"] for d in (dist or []) if d["temp"] == p), 0.0)
-        is_ctr    = idx == 1
-        prefix    = "⭐" if is_ctr else "  "
-        alloc     = state["budget"] / 3
-        mkt       = state["mkt_prices"].get(p)
+    for i, bk in enumerate(brackets):
+        dist = abs(i - center_idx)
+        if dist > 1: continue
+        label  = "LOW   " if i < center_idx else ("CENTER" if i == center_idx else "HIGH  ")
+        mp_str, edge_str, profit_str = "", "", ""
+        if bk.get("manual_price"):
+            mp  = bk["manual_price"]
+            ed  = bk.get("edge")
+            pft = alloc * (1 - mp) / mp if mp > 0 else 0
+            mp_str  = f"  mkt {mp*100:.0f}¢"
+            profit_str = f"  win +${pft:.2f}"
+            if ed is not None:
+                sign = "+" if ed >= 0 else ""
+                edge_str = f"  edge {sign}{ed*100:.1f}%"
+        model_str = f"{bk['model_prob']*100:.1f}%" if bk.get("model_prob") is not None else " — "
+        pos_rows.append(
+            f"  {label}  {bk['label']:<11}  {model_str:>6}{mp_str}{edge_str}{profit_str}"
+        )
+    pos_rows.append("  " + "─"*38)
+    budget_str  = f"${state['budget']:.2f}"
+    maxloss_str = f"${state['budget']*state['stop_loss']/100:.2f}"
+    pos_rows.append(f"  Budget {budget_str}  ·  ${alloc:.2f}/bracket  ·  max loss {maxloss_str}")
+    lines.append(c("\n".join(pos_rows)))
 
-        edge_part = ""
-        if mkt:
-            edge = model_pct / 100 - mkt
-            sign = "+" if edge >= 0 else ""
-            edge_part = "   edge {}{:.1f}%".format(sign, edge * 100)
-
-        mkt_part  = "   mkt ${:.2f}".format(mkt) if mkt else ""
-        ctr_label = "  ← center" if is_ctr else ""
-
-        pos_rows.append("{} {:>3}°{}   {:>5.1f}%   ${:>6.2f}{}{}{}".format(
-            prefix, p, unit, model_pct, alloc, mkt_part, edge_part, ctr_label))
-
-    lines.append(pre("\n".join(pos_rows)))
-    lines.append("")
-
-    budget_str = "${:.2f}".format(state["budget"])
-    sl_str     = "{}%".format(state["stop_loss"])
-    lines.append("💰  Budget  " + b(budget_str) + "  ·  Stop loss  " + b(sl_str))
-
-    return "\n".join(lines)
-
-
-def msg_markets(state):
-    apt  = AIRPORTS[state["airport"]]
-    poly = state.get("poly")
-
-    if poly is None:
-        return "\n".join([b("🏪 Polymarket Markets"), DIV, "", "No data — use Fetch All first."])
-    if not poly:
-        return "\n".join([b("🏪 Polymarket Markets"), DIV, "",
-                          "No markets found for {} temperature.".format(b(esc(apt["city"])))])
-
-    header = "🏪 Polymarket Markets  ·  {} {}".format(b(esc(apt["name"])), esc(apt["city"]))
-    lines  = [b("🏪 Polymarket Markets"), DIV,
-              it("{} markets found".format(len(poly))), ""]
-
-    for m in poly[:10]:
-        q = (m.get("question") or m.get("title") or m.get("slug") or "Unknown")
-        q = esc(q[:70] + ("…" if len(q) > 70 else ""))
-
-        prices_raw = m.get("outcomePrices", "[]")
-        try:   prices = json.loads(prices_raw) if isinstance(prices_raw, str) else (prices_raw or [])
-        except: prices = []
-
-        out_raw = m.get("outcomes", '["Yes","No"]')
-        try:   outcomes = json.loads(out_raw) if isinstance(out_raw, str) else (out_raw or ["Yes", "No"])
-        except: outcomes = ["Yes", "No"]
-
-        price_parts = []
-        for oi, o in enumerate(outcomes[:2]):
-            if oi < len(prices) and prices[oi] is not None:
-                try:
-                    pv = float(prices[oi])
-                    price_parts.append("{}: {}".format(esc(str(o)), b("${:.2f}".format(pv))))
-                except Exception:
-                    pass
-
-        vol = m.get("volume") or m.get("volumeNum")
-        end = m.get("endDate") or m.get("endDateIso", "")
-
-        meta = []
-        if price_parts: meta.append("  ".join(price_parts))
-        if vol:
-            try: meta.append("Vol ${:,}".format(int(float(vol))))
-            except: pass
-        if end:
-            try: meta.append("Closes {}".format(end[:10]))
-            except: pass
-
-        lines.append("• " + q)
-        if meta: lines.append("  " + it("  ·  ".join(meta)))
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def msg_strategy(state):
-    con = build_consensus(state)
-    if not con:
-        return "\n".join([b("💡 Strategy"), DIV, "", "No data — use Fetch All first."])
-
-    apt   = AIRPORTS[state["airport"]]
-    unit  = state["unit"]
-    h     = con["hours"]
-    dist  = build_dist(state, con)
-    pos   = get_pos(state, con)
-    alloc = state["budget"] / 3
-    typ   = "High" if state["market_type"] == "high" else "Low"
-
-    header = "{} Daily {}  ·  {}".format(apt["name"], typ, day_label(state["day_offset"]))
-    lines  = [b("💡 Strategy  ·  " + esc(header)), DIV, "", b("📦  3-Position Entry Plan"), SDIV]
-
-    pos_rows = []
-    for idx, p in enumerate(pos):
-        model_pct  = next((d["pct"] for d in (dist or []) if d["temp"] == p), 0.0)
-        label      = "LOW   " if idx == 0 else "CENTER" if idx == 1 else "HIGH  "
-        mkt        = state["mkt_prices"].get(p)
-        edge_str   = ""
-        profit_str = ""
-        if mkt:
-            edge       = model_pct / 100 - mkt
-            profit     = alloc * (1 - mkt) / mkt if mkt > 0 else 0
-            sign       = "+" if edge >= 0 else ""
-            edge_str   = "  edge {}{:.1f}%".format(sign, edge * 100)
-            profit_str = "  win +${:.2f}".format(profit)
-        mkt_str = "  mkt ${:.2f}".format(mkt) if mkt else ""
-        pos_rows.append("  {}  {:>3}°{}  {:>5.1f}%  ${:.2f}{}{}{}".format(
-            label, p, unit, model_pct, alloc, mkt_str, edge_str, profit_str))
-
-    lines.append(pre("\n".join(pos_rows)))
-
-    budget_str  = "${:.2f}".format(state["budget"])
-    maxloss_str = "${:.2f}".format(state["budget"] * state["stop_loss"] / 100)
-    alloc_str   = "${:.2f}".format(alloc)
-    sl_str      = "{}%".format(state["stop_loss"])
-
-    lines += [
-        "",
-        "💰  Budget {}  ·  {}/leg  ·  Max loss {}".format(
-            b(budget_str), alloc_str, b(maxloss_str)),
-        "",
-        b("🛡️  Stop Loss Rules"),
-        SDIV,
-    ]
-
+    # Stop loss rules
+    lines += ["", b("🛡️  Stop Loss Rules"), SDIV]
+    ctr_label = brackets[center_idx]["label"] if brackets else "?"
+    unit_sym  = "°" + unit
     rules = (
-        "  Rule 1 — PRICE STOP\n"
-        "  Exit any leg if it drops {} from entry. No exceptions.\n"
-        "\n"
-        "  Rule 2 — CONSENSUS SHIFT\n"
-        "  If model moves >2°{} from center ({}°), exit outer legs first.\n"
-        "\n"
-        "  Rule 3 — HOLD WINNER\n"
-        "  Center >$0.75 with <6h left → hold to resolution.\n"
-        "\n"
-        "  Rule 4 — CORRELATED DROP\n"
-        "  All 3 legs fall together → regime change. Exit all."
-    ).format(sl_str, unit, pos[1])
+        f"  1  PRICE STOP  ({state['stop_loss']}%)\n"
+        f"     Exit any bracket if it drops {state['stop_loss']}% from entry.\n"
+        f"\n"
+        f"  2  CONSENSUS SHIFT\n"
+        f"     Model moves >2{unit_sym} from center ({esc(ctr_label)})?\n"
+        f"     Exit outer brackets first.\n"
+        f"\n"
+        f"  3  HOLD WINNER\n"
+        f"     Center >75¢ with <6h left  →  hold to resolution.\n"
+        f"\n"
+        f"  4  CORRELATED DROP\n"
+        f"     All 3 brackets drop together  →  exit full position."
+    )
+    lines.append(c(rules))
 
-    lines.append(pre(rules))
-    lines += ["", b("⏱️  Entry Window  ({:.0f}h left)".format(h)), SDIV]
-
+    # Entry timing
+    lines += ["", b(f"⏱  Entry Window  ({hours_label(h)} left)"), SDIV]
     if h > 60:
-        tip = ("  🌐 EARLY WINDOW (60h+)\n"
-               "  ECMWF ensemble dominant. Markets usually mispriced at open.\n"
-               "  Best entry price — enter if confidence >60.")
+        tip = (
+            "  🌐 EARLY WINDOW (60h+)\n"
+            "  ECMWF dominant. Markets usually mispriced at open.\n"
+            "  Best price opportunity — enter if confidence >60."
+        )
     elif h > 36:
-        tip = ("  📡 MID WINDOW (36–60h)\n"
-               "  HRRR begins outperforming ECMWF. Confirm consensus hasn't\n"
-               "  shifted since open. Good scale-in window.")
+        tip = (
+            "  📡 MID WINDOW (36-60h)\n"
+            "  HRRR begins outperforming. Confirm consensus hasn't\n"
+            "  shifted. Good scale-in window."
+        )
     elif h > 12:
-        tip = ("  🎯 LATE WINDOW (12–36h)\n"
-               "  HRRR dominant. METAR anchoring short-term. Highest model\n"
-               "  accuracy. Best conviction window for entry.")
+        tip = (
+            "  🎯 LATE WINDOW (12-36h)\n"
+            "  HRRR dominant, METAR anchoring. Highest model accuracy.\n"
+            "  Best conviction entry window."
+        )
     else:
-        tip = ("  🔴 FINAL WINDOW (0–12h)\n"
-               "  METAR is now ground truth. Do NOT open new positions.\n"
-               "  Manage existing: hold winners, cut positions below stop.")
-    lines.append(pre(tip))
-
+        tip = (
+            "  🔴 FINAL (<12h)\n"
+            "  METAR is ground truth. Do NOT open new positions.\n"
+            "  Manage existing: hold winners, cut below stop."
+        )
+    lines.append(c(tip))
     return "\n".join(lines)
 
 
-def msg_ai(state):
+def msg_ai(state: Dict, city: Dict, consensus: Dict, brackets: List[Dict], center_idx: int) -> str:
     if not ANTHROPIC_KEY:
         return "\n".join([
             b("🤖 AI Analysis"), DIV, "",
             "No Anthropic API key configured.", "",
             "Add " + c("ANTHROPIC_KEY=your_key") + " to your " + c(".env") + " file.",
         ])
-
-    con = build_consensus(state)
-    if not con:
-        return "No data — fetch first."
-
-    apt  = AIRPORTS[state["airport"]]
-    unit = state["unit"]
-    dist = build_dist(state, con)
-    pos  = get_pos(state, con)
-
-    top_b = ", ".join(
-        "{}°{}:{:.1f}%".format(d["temp"], unit, d["pct"])
-        for d in sorted(dist or [], key=lambda x: -x["prob"])[:8]
-        if d["prob"] > 0.02
+    active = state["active"]
+    unit   = city["unit"]
+    top_b  = "  ".join(
+        f"{bk['label']} {bk['model_prob']*100:.1f}%"
+        for bk in brackets if bk.get("model_prob",0) > 0.03
     )
-    mkt_str = ", ".join(
-        "{}°:{}".format(p, state["mkt_prices"].get(p, "?")) for p in pos
+    pos_bks = [brackets[i] for i in range(max(0,center_idx-1), min(len(brackets),center_idx+2))]
+    mkt_str = "  ".join(
+        f"{bk['label']} mkt={bk['manual_price']*100:.0f}¢" if bk.get("manual_price") else f"{bk['label']} mkt=?"
+        for bk in pos_bks
     )
-    src_str = " | ".join(
-        "{}={:.1f}°".format(s["name"], s["temp"]) for s in con["sources"]
+    src_str = "  |  ".join(
+        f"{s['name']} {s['temp']:.1f}°" for s in consensus["sources"]
     )
-
-    prompt_lines = [
-        "Expert prediction market weather trader. Return JSON only, no markdown.",
-        "",
-        "MARKET: {} {} Daily {} °{}".format(
-            state["airport"], apt["city"],
-            "HIGH" if state["market_type"] == "high" else "LOW", unit),
-        "DAY: +{}d  HOURS: {:.1f}h".format(state["day_offset"], con["hours"]),
-        "CONSENSUS: {:.1f}°{}".format(con["temp"], unit),
-        "SOURCES: {}".format(src_str),
-        "SPREADS: model=±{:.1f}° ecmwf=±{:.1f}°".format(
-            con["model_spread"], con["ecmwf_spread"]),
-        "CONFIDENCE: {:.0f}/100".format(con["confidence"]),
-        "ECMWF TOP: {}".format(top_b),
-        "POSITIONS: {}°, {}° (center), {}°{}".format(pos[0], pos[1], pos[2], unit),
-        "MARKET PRICES: {}".format(mkt_str),
-        "",
-        ('Return: {"signal":"GO|CAUTIOUS|NO-GO","confidence":0-100,'
-         '"summary":"1-2 sentences","flags":["..."],'
-         '"stop_loss":"specific advice","timing":"entry timing","edge":"N/A or calc"}'),
-    ]
-
+    prompt = (
+        f"Expert prediction market weather trader. Return JSON only.\n\n"
+        f"MARKET: {city['display']} Daily {'HIGH' if active['market_type']=='highest' else 'LOW'} °{unit}\n"
+        f"DAY: {day_label(active['target_date'])}  HOURS: {consensus['hours']:.1f}h\n"
+        f"STATION: {city['station']} ({city['metar']}) confirmed={city['ok']}\n"
+        f"CONSENSUS: {consensus['temp']:.1f}°{unit}\n"
+        f"SOURCES: {src_str}\n"
+        f"SPREADS: model ±{consensus['model_spread']:.1f}° ecmwf ±{consensus['ecmwf_spread']:.1f}°\n"
+        f"CONFIDENCE: {consensus['confidence']:.0f}/100\n"
+        f"TOP BRACKETS: {top_b}\n"
+        f"POSITIONS: {mkt_str}\n\n"
+        "Return: "
+        '{"signal":"GO|CAUTIOUS|NO-GO","confidence":0-100,'
+        '"summary":"1-2 sentences","flags":["..."],'
+        '"stop_loss":"specific advice","timing":"entry timing","edge":"N/A or calc"}'
+    )
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json",
-                     "x-api-key": ANTHROPIC_KEY,
-                     "anthropic-version": "2023-06-01"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 600,
-                  "messages": [{"role": "user", "content": "\n".join(prompt_lines)}]},
+            headers={"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,"anthropic-version":"2023-06-01"},
+            json={"model":"claude-sonnet-4-20250514","max_tokens":600,
+                  "messages":[{"role":"user","content":prompt}]},
             timeout=30,
         )
-        raw  = r.json()["content"][0]["text"]
-        data = json.loads(raw.replace("```json", "").replace("```", "").strip())
-
-        sig      = data.get("signal", "?")
-        sig_icon = {"GO": "🟢", "CAUTIOUS": "🟡", "NO-GO": "🔴"}.get(sig, "⚪")
-        conf_val = data.get("confidence", "?")
-
+        data = json.loads(r.json()["content"][0]["text"].replace("```json","").replace("```","").strip())
+        sig  = data.get("signal","?")
+        icon = {"GO":"🟢","CAUTIOUS":"🟡","NO-GO":"🔴"}.get(sig,"⚪")
+        conf = data.get("confidence","?")
         parts = [
-            b("{} AI Signal: {}".format(sig_icon, sig)) + "  " + it("({}/100)".format(conf_val)),
+            b(f"{icon}  AI Signal: {sig}") + "  " + it(f"({conf}/100)"),
             DIV,
-            esc(data.get("summary", "")),
+            esc(data.get("summary","")),
         ]
-        flags = data.get("flags", [])
-        if flags:
-            parts += ["", b("⚠️  Risk Flags")] + ["  • " + esc(f) for f in flags]
+        for f_ in data.get("flags",[]):
+            parts.append("  ⚠️ " + esc(f_))
         if data.get("stop_loss"):
             parts += ["", b("📉 Stop Loss:") + "  " + esc(data["stop_loss"])]
         if data.get("timing"):
@@ -629,427 +852,594 @@ def msg_ai(state):
         if data.get("edge") and data["edge"] != "N/A":
             parts += [b("📊 Edge:") + "  " + esc(data["edge"])]
         return "\n".join(parts)
-
     except Exception as e:
         return b("⚠️ AI Error") + "\n\n" + esc(str(e))
 
-
-# ── Keyboards ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYBOARDS
+# ─────────────────────────────────────────────────────────────────────────────
 def kb_main():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄  Fetch All Data",     callback_data="fetch_all")],
-        [InlineKeyboardButton("🏢  Airport",            callback_data="menu_airport"),
-         InlineKeyboardButton("📅  Day",                callback_data="menu_day")],
-        [InlineKeyboardButton("🌡️  High / Low",         callback_data="menu_type"),
-         InlineKeyboardButton("°F  /  °C",              callback_data="menu_unit")],
-        [InlineKeyboardButton("📊  Forecast",           callback_data="show_forecast"),
-         InlineKeyboardButton("🏪  Markets",            callback_data="show_markets")],
+        [InlineKeyboardButton("🌡  Browse Markets",      callback_data="browse_markets")],
+        [InlineKeyboardButton("🔄  Refresh Analysis",   callback_data="refresh_analysis"),
+         InlineKeyboardButton("📊  Distribution Chart", callback_data="send_chart")],
         [InlineKeyboardButton("💡  Strategy",           callback_data="show_strategy"),
          InlineKeyboardButton("🤖  AI Signal",          callback_data="run_ai")],
+        [InlineKeyboardButton("⚙️  Settings",           callback_data="show_settings")],
     ])
 
-def kb_forecast():
+def kb_analysis():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊  Distribution Chart",  callback_data="send_chart"),
-         InlineKeyboardButton("🔄  Refresh",             callback_data="fetch_all")],
-        [InlineKeyboardButton("🏪  Markets",              callback_data="show_markets"),
-         InlineKeyboardButton("💡  Strategy",             callback_data="show_strategy")],
-        [InlineKeyboardButton("🤖  AI Signal",            callback_data="run_ai"),
-         InlineKeyboardButton("←  Menu",                  callback_data="back_main")],
+         InlineKeyboardButton("💡  Strategy",            callback_data="show_strategy")],
+        [InlineKeyboardButton("🤖  AI Signal",           callback_data="run_ai"),
+         InlineKeyboardButton("🌡  Browse Markets",      callback_data="browse_markets")],
+        [InlineKeyboardButton("←  Menu",                 callback_data="back_main")],
     ])
 
 def kb_back():
     return InlineKeyboardMarkup([[InlineKeyboardButton("←  Main Menu", callback_data="back_main")]])
 
-def kb_airports(current):
-    items = list(AIRPORTS.items())
-    rows  = []
-    for i in range(0, len(items), 2):
-        rows.append([
-            InlineKeyboardButton(
-                "{}{} {}".format("✓ " if k == current else "", v["name"], v["city"]),
-                callback_data="set_airport_" + k,
-            )
-            for k, v in items[i:i+2]
-        ])
-    rows.append([InlineKeyboardButton("←  Back", callback_data="back_main")])
-    return InlineKeyboardMarkup(rows)
+def kb_market_list(events: List[Dict], page: int) -> InlineKeyboardMarkup:
+    grouped  = group_events_by_date(events)
+    buttons  = []
+    ITEMS_PER_PAGE = 12
+    all_ev   = [ev for group in grouped.values() for ev in group]
+    total    = len(all_ev)
+    page_ev  = all_ev[page*ITEMS_PER_PAGE:(page+1)*ITEMS_PER_PAGE]
 
-def kb_day(cur):
+    row = []
+    for ev in page_ev:
+        ck   = ev["city_key"]
+        city = CITY_DB.get(ck)
+        flag = city["flag"] if city else "🌍"
+        disp = (city["display"] if city else ck.replace("-"," ").title())[:14]
+        typ  = "🌡" if ev["market_type"]=="highest" else "❄️"
+        label = f"{flag}{typ} {disp}"
+        row.append(InlineKeyboardButton(label, callback_data=f"select_event_{ev['slug']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("← Prev", callback_data=f"market_page_{page-1}"))
+    total_pages = math.ceil(total / ITEMS_PER_PAGE)
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next →", callback_data=f"market_page_{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("←  Main Menu", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+def kb_settings(state: Dict):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("{}Today".format("✓ " if cur == 0 else ""),    callback_data="set_day_0"),
-         InlineKeyboardButton("{}Tomorrow".format("✓ " if cur == 1 else ""), callback_data="set_day_1"),
-         InlineKeyboardButton("{}+2 Days".format("✓ " if cur == 2 else ""),  callback_data="set_day_2")],
+        [InlineKeyboardButton(f"Budget: ${state['budget']:.0f}", callback_data="set_budget"),
+         InlineKeyboardButton(f"Stop: {state['stop_loss']}%",    callback_data="set_stoploss")],
         [InlineKeyboardButton("←  Back", callback_data="back_main")],
     ])
 
-def kb_type(cur):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("{}🌡️  Daily High".format("✓ " if cur == "high" else ""), callback_data="set_type_high"),
-         InlineKeyboardButton("{}❄️  Daily Low".format("✓ " if cur == "low"  else ""), callback_data="set_type_low")],
-        [InlineKeyboardButton("←  Back", callback_data="back_main")],
-    ])
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def get_active_analysis(state: Dict) -> Optional[Tuple]:
+    """
+    Returns (city, consensus, brackets, center_idx) for the active market,
+    or None if not ready.
+    """
+    active = state.get("active")
+    if not active: return None
+    city = CITY_DB.get(active["city_key"])
+    if not city: return None
 
-def kb_unit(cur):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("{}  Fahrenheit  °F".format("✓" if cur == "F" else ""), callback_data="set_unit_F"),
-         InlineKeyboardButton("{}  Celsius  °C".format("✓" if cur == "C" else ""),    callback_data="set_unit_C")],
-        [InlineKeyboardButton("←  Back", callback_data="back_main")],
-    ])
+    consensus = build_consensus(
+        state["data"], active["target_date"],
+        active["market_type"], city["unit"], active["city_key"]
+    )
+    if not consensus: return None
 
-# ── Handlers ───────────────────────────────────────────────────────────────────
+    brackets   = enrich_brackets(active.get("brackets",[]), consensus, state["mkt_prices"])
+    center_idx = (
+        state["center_override"] if state.get("center_override") is not None
+        else find_center_bracket(consensus, brackets)
+    )
+    return city, consensus, brackets, center_idx
+
+
+async def run_fetch_and_reply(q_or_msg, state: Dict, city: Dict):
+    """Background fetch + send analysis (used from callback and command)."""
+    active = state["active"]
+    status = await asyncio.to_thread(
+        fetch_all_weather, city, active["target_date"], city["unit"], state["data"]
+    )
+    result = get_active_analysis(state)
+    if not result:
+        text = "\n".join([b("❌  No Data"), "", "Weather APIs returned no data for this station."])
+        try:
+            await q_or_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back())
+        except Exception:
+            await q_or_msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back())
+        return
+    city_, con, bks, ctr = result
+    sl   = "  ".join(f"{k} {v}" for k, v in status.items())
+    text = msg_analysis(state, city_, con, bks, ctr) + f"\n\n{SDIV}\n{it(sl)}"
+    try:
+        await q_or_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_analysis())
+    except Exception:
+        await q_or_msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_analysis())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid   = update.effective_chat.id
     state = get_state(cid)
-    apt   = AIRPORTS[state["airport"]]
-
-    apt_row  = "{:5}  {}".format(apt["name"], apt["city"])
-    type_row = "{:5}  Daily {}".format(
-        "High" if state["market_type"] == "high" else "Low",
-        "High" if state["market_type"] == "high" else "Low")
-    day_row  = "{:8}  Target day".format(day_label(state["day_offset"]))
-    unit_row = "°{:4}  Unit".format(state["unit"])
+    active = state.get("active")
+    last  = ""
+    if active:
+        ck   = active["city_key"]
+        city = CITY_DB.get(ck, {})
+        last = (
+            f"\n\n{b('Last market')}\n{SDIV}\n"
+            f"{c(city.get('display',ck))} {c(city.get('station',''))}"
+            f"\n{c(day_label(active['target_date']))}"
+            f"  {'High' if active['market_type']=='highest' else 'Low'}"
+        )
 
     text = "\n".join([
         b("⛅  WeatherEdge"),
         DIV,
-        it("Polymarket Weather Trading Bot"),
+        it("Polymarket Weather Trading Assistant"),
         "",
-        ("Combines ECMWF ensemble (51 members), HRRR, METAR/ASOS, and "
-         "OpenWeather into a time-weighted forecast for Polymarket daily "
-         "temperature markets. Recommends 3 adjacent positions with confidence "
-         "scoring and edge calculation."),
+        (
+            "Multi-model consensus combining ECMWF ensemble, HRRR, "
+            "METAR/ASOS, and OpenWeather for Polymarket temperature markets. "
+            "All resolution stations verified directly from Polymarket rules."
+        ),
         "",
-        b("Current Target"),
+        b("Quick commands"),
         SDIV,
-        c(apt_row),
-        c(type_row),
-        c(day_row),
-        c(unit_row),
-        "",
-        b("Quick Commands"),
-        SDIV,
-        c("/price 72 0.35") + "  log a market price",
-        c("/budget 30")     + "  set total budget",
+        c("/markets")        + "  browse live markets",
+        c("/price 70-71°F 0.28") + "  log bracket price",
+        c("/budget 30")     + "  set budget",
         c("/stoploss 50")   + "  set stop loss %",
-        c("/override 73")   + "  override center position",
-        c("/reset")         + "  clear prices + override",
         c("/help")          + "  all commands",
-    ])
+    ]) + last
+
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join([
-        b("⛅  WeatherEdge  —  Commands"),
+        b("⛅  WeatherEdge  —  Help"),
         DIV, "",
         b("Navigation"),
-        c("/start")     + "           main menu",
-        c("/fetch")     + "           fetch all data + forecast",
-        c("/forecast")  + "           current consensus",
-        c("/chart")     + "           ECMWF distribution chart",
-        c("/markets")   + "           live Polymarket listings",
-        c("/strategy")  + "           3-position entry plan",
-        c("/analyze")   + "           AI trading signal",
+        c("/start")      + "           main menu",
+        c("/markets")    + "           browse live markets",
+        c("/refresh")    + "           re-fetch weather + show analysis",
+        c("/chart")      + "           distribution chart",
+        c("/strategy")   + "           3-bracket entry plan",
+        c("/analyze")    + "           AI trading signal",
         "",
         b("Configuration"),
-        c("/price [T] [P]")  + "   log market price",
-        "                    " + it("e.g. /price 72 0.35"),
-        c("/budget [amt]")   + "    set total budget",
-        "                    " + it("e.g. /budget 30"),
-        c("/stoploss [%]")   + "    set stop loss %",
-        "                    " + it("e.g. /stoploss 50"),
-        c("/override [T]")   + "    override center position",
-        "                    " + it("e.g. /override 73"),
-        c("/reset")          + "           clear prices + override",
+        c('/price "70-71°F" 0.28') + "",
+        "                    " + it("log a bracket's market price"),
+        c("/budget 30")  + "           set total budget",
+        c("/stoploss 50")+ "           set stop loss %",
+        c("/override 2") + "           override center bracket index",
+        c("/reset")      + "           clear prices + override",
+        "",
+        b("How it works"),
+        SDIV,
+        "1. Browse markets → tap a city",
+        "2. Bot fetches ECMWF, HRRR, METAR for the",
+        it("   exact Polymarket resolution station"),
+        "3. Builds weighted consensus + confidence score",
+        "4. Maps ECMWF ensemble to actual market brackets",
+        "5. Recommends 3 adjacent brackets + edge calc",
     ])
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid   = update.effective_chat.id
     state = get_state(cid)
     msg   = await update.message.reply_text(
-        "\n".join([b("⏳  Fetching data…"), SDIV,
-                   it("Pulling HRRR · ECMWF · METAR · OpenWeather · Polymarket")]),
-        parse_mode=ParseMode.HTML,
+        f"{b('⏳  Fetching markets…')}\n{SDIV}\n{it('Loading all active temperature events from Polymarket…')}",
+        parse_mode=ParseMode.HTML
     )
-    status = await asyncio.to_thread(fetch_all, state)
-    sl_str = "  ".join("{} {}".format(k, v) for k, v in status.items())
-    text   = "{}\n\n{}\n{}".format(msg_forecast(state), SDIV, it(sl_str))
-    await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_forecast())
+    events = await asyncio.to_thread(fetch_poly_events)
+    state["cached_events"] = events
+    state["markets_page"]  = 0
+    text = msg_market_list(events, 0)
+    await msg.edit_text(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=kb_market_list(events, 0)
+    )
 
 
-async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid   = update.effective_chat.id
     state = get_state(cid)
-    await update.message.reply_text(msg_forecast(state), parse_mode=ParseMode.HTML, reply_markup=kb_forecast())
+    if not state.get("active"):
+        await update.message.reply_text(
+            f"{b('⚠️  No market selected')}\n\nUse /markets to pick one first.",
+            parse_mode=ParseMode.HTML, reply_markup=kb_back()
+        )
+        return
+    ck   = state["active"]["city_key"]
+    city = CITY_DB.get(ck)
+    if not city:
+        await update.message.reply_text(f"City {ck} not in database.", parse_mode=ParseMode.HTML)
+        return
+    msg = await update.message.reply_text(
+        f"{b('⏳  Refreshing…')}\n{SDIV}\n{it('ECMWF  ·  HRRR  ·  METAR  ·  OpenWeather')}",
+        parse_mode=ParseMode.HTML
+    )
+    await run_fetch_and_reply(msg, state, city)
 
 
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
+    cid   = update.effective_chat.id
     state = get_state(cid)
-    con  = build_consensus(state)
-    if not con:
+    result = get_active_analysis(state)
+    if not result:
         await update.message.reply_text(
-            "\n".join([b("❌  No Data"), "", "Use /fetch first."]),
-            parse_mode=ParseMode.HTML)
+            f"{b('❌  No Data')}\n\nFetch a market first with /markets.",
+            parse_mode=ParseMode.HTML
+        )
         return
-    dist = build_dist(state, con)
-    if not dist:
-        await update.message.reply_text(
-            "\n".join([b("❌  No ECMWF Data"), "", "ECMWF ensemble didn't load."]),
-            parse_mode=ParseMode.HTML)
-        return
-    apt = AIRPORTS[state["airport"]]
-    pos = get_pos(state, con)
-    buf = await asyncio.to_thread(make_chart, dist, pos, state["unit"],
-                                  apt["name"], apt["city"], con["confidence"], state["market_type"])
-    caption = ("ECMWF Ensemble  ·  {} {}  ·  Daily {}\n"
-               "{}  ·  {:.1f}°{}  ·  Confidence {:.0f}/100").format(
-               apt["name"], apt["city"],
-               "High" if state["market_type"] == "high" else "Low",
-               day_label(state["day_offset"]), con["temp"], state["unit"], con["confidence"])
-    await update.message.reply_photo(photo=buf, caption=caption)
-
-
-async def cmd_markets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
-    state = get_state(cid)
-    await update.message.reply_text(msg_markets(state), parse_mode=ParseMode.HTML, reply_markup=kb_back())
+    city, con, bks, ctr = result
+    active = state["active"]
+    buf = await asyncio.to_thread(
+        make_chart, bks, ctr,
+        city["display"], active["market_type"], city["unit"], con["confidence"]
+    )
+    cap = (
+        f"ECMWF Ensemble  ·  {city['display']} Daily "
+        f"{'High' if active['market_type']=='highest' else 'Low'}"
+        f"\n{day_label(active['target_date'])}  ·  "
+        f"Consensus {con['temp']:.1f}°{city['unit']}  ·  "
+        f"Confidence {con['confidence']:.0f}/100"
+    )
+    await update.message.reply_photo(photo=buf, caption=cap)
 
 
 async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
+    cid   = update.effective_chat.id
     state = get_state(cid)
-    await update.message.reply_text(msg_strategy(state), parse_mode=ParseMode.HTML, reply_markup=kb_back())
+    result = get_active_analysis(state)
+    if not result:
+        await update.message.reply_text(
+            f"{b('❌  No Data')}\n\nFetch a market first with /markets.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    city, con, bks, ctr = result
+    await update.message.reply_text(
+        msg_strategy(state, city, bks, ctr, con),
+        parse_mode=ParseMode.HTML, reply_markup=kb_back()
+    )
 
 
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
+    cid   = update.effective_chat.id
     state = get_state(cid)
-    msg  = await update.message.reply_text(
-        "\n".join([b("🤖  Running AI Analysis…"), SDIV, it("Synthesizing model data…")]),
-        parse_mode=ParseMode.HTML,
+    result = get_active_analysis(state)
+    if not result:
+        await update.message.reply_text(
+            f"{b('❌  No Data')}\n\nFetch a market first with /markets.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    msg = await update.message.reply_text(
+        f"{b('🤖  Running AI Analysis…')}\n{SDIV}\n{it('Synthesising forecast data…')}",
+        parse_mode=ParseMode.HTML
     )
-    result = await asyncio.to_thread(msg_ai, state)
-    await msg.edit_text(result, parse_mode=ParseMode.HTML, reply_markup=kb_back())
+    city, con, bks, ctr = result
+    result_text = await asyncio.to_thread(msg_ai, state, city, con, bks, ctr)
+    await msg.edit_text(result_text, parse_mode=ParseMode.HTML, reply_markup=kb_back())
 
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
+    cid   = update.effective_chat.id
     state = get_state(cid)
-    args = context.args or []
-    if len(args) < 2:
+    # Usage: /price 70-71°F 0.28  OR  /price "70-71°F" 0.28
+    text_raw = " ".join(context.args or [])
+    # Try to parse last token as price, everything before as bracket label
+    parts = text_raw.rsplit(None, 1)
+    if len(parts) < 2:
         await update.message.reply_text(
-            "\n".join([b("📌  Log Market Price"), SDIV, "",
-                       "Usage:  " + c("/price [temp] [price]"),
-                       "Example:  " + c("/price 72 0.35")]),
-            parse_mode=ParseMode.HTML)
+            f"{b('📌  Log Bracket Price')}\n{SDIV}\n\n"
+            f"Usage:  {c('/price [bracket] [price]')}\n"
+            f"Example:  {c('/price 70-71°F 0.28')}\n"
+            f"Price is between 0 and 1 (e.g. 0.28 = 28¢).",
+            parse_mode=ParseMode.HTML
+        )
         return
+    label = parts[0].strip().strip('"').strip("'")
     try:
-        temp  = int(args[0])
-        price = float(args[1])
+        price = float(parts[1])
         if not 0 < price < 1: raise ValueError
-        state["mkt_prices"][temp] = price
-
-        con  = build_consensus(state)
-        dist = build_dist(state, con) if con else None
-        mp   = next((d["pct"] for d in (dist or []) if d["temp"] == temp), None)
-
-        logged_row = "{}°{}  →  ${:.2f}".format(temp, state["unit"], price)
-        parts = [b("✅  Price Logged"), SDIV, c(logged_row)]
-        if mp is not None:
-            edge = mp / 100 - price
-            sign = "+" if edge >= 0 else ""
-            icon = "🟢" if edge > 0.05 else "🟡" if edge > -0.05 else "🔴"
-            parts += ["",
-                      "Model prob:  " + b("{:.1f}%".format(mp)),
-                      "Edge:  " + b("{}{:.1f}%".format(sign, edge * 100)) + "  " + icon]
-        await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
     except (ValueError, IndexError):
         await update.message.reply_text(
-            "\n".join([b("❌  Invalid Input"), "",
-                       "Usage:  " + c("/price 72 0.35"),
-                       "Price must be between 0 and 1."]),
-            parse_mode=ParseMode.HTML)
+            f"{b('❌  Invalid price')}\n\nPrice must be between 0 and 1.\n"
+            f"Example:  {c('/price 70-71°F 0.28')}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    state["mkt_prices"][label] = price
+
+    # Show edge if we have data
+    result = get_active_analysis(state)
+    lines  = [b("✅  Price Logged"), SDIV, c(f"{label}  →  {price*100:.0f}¢")]
+    if result:
+        _, con, bks, _ = result
+        bk = next((b_ for b_ in bks if b_["label"]==label), None)
+        if bk and bk.get("model_prob") is not None:
+            edge = bk["model_prob"] - price
+            sign = "+" if edge >= 0 else ""
+            icon = "🟢" if edge > 0.05 else "🟡" if edge > -0.05 else "🔴"
+            model_pct_str = "{:.1f}%".format(bk["model_prob"]*100)
+            edge_pct_str  = "{}{:.1f}%".format(sign, edge*100)
+            lines += [
+                "",
+                "Model:  " + b(model_pct_str),
+                "Edge:   " + b(edge_pct_str) + "  " + icon,
+            ]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
+    cid   = update.effective_chat.id
     state = get_state(cid)
     try:
         state["budget"] = float((context.args or [])[0])
-        total_str = "${:.2f}".format(state["budget"])
-        leg_str   = "${:.2f}".format(state["budget"] / 3)
+        total_str  = "${:.2f}".format(state["budget"])
+        per_leg_str = "${:.2f}".format(state["budget"]/3)
         await update.message.reply_text(
-            "\n".join([b("✅  Budget Updated"), SDIV,
-                       c("Total:   " + total_str),
-                       c("Per leg: " + leg_str)]),
-            parse_mode=ParseMode.HTML)
+            b("✅  Budget Updated") + "\n" + SDIV + "\n"
+            + c("Total:   " + total_str) + "\n"
+            + c("Per leg: " + per_leg_str),
+            parse_mode=ParseMode.HTML
+        )
     except Exception:
-        await update.message.reply_text("Usage:  " + c("/budget 30"), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"Usage:  {c('/budget 30')}", parse_mode=ParseMode.HTML)
 
 
 async def cmd_stoploss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
+    cid   = update.effective_chat.id
     state = get_state(cid)
     try:
         state["stop_loss"] = int((context.args or [])[0])
-        sl_str = "Exit any leg if it drops  {}%  from entry".format(state["stop_loss"])
+        sl_msg = "Exit any bracket if it drops  {}%  from entry".format(state["stop_loss"])
         await update.message.reply_text(
-            "\n".join([b("✅  Stop Loss Updated"), SDIV, c(sl_str)]),
-            parse_mode=ParseMode.HTML)
+            b("✅  Stop Loss Updated") + "\n" + SDIV + "\n" + c(sl_msg),
+            parse_mode=ParseMode.HTML
+        )
     except Exception:
-        await update.message.reply_text("Usage:  " + c("/stoploss 50"), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"Usage:  {c('/stoploss 50')}", parse_mode=ParseMode.HTML)
 
 
 async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
+    cid   = update.effective_chat.id
     state = get_state(cid)
     try:
-        state["center_override"] = int((context.args or [])[0])
-        ov_str = "Positions will center on  {}°{}".format(
-            state["center_override"], state["unit"])
+        idx = int((context.args or [])[0])
+        state["center_override"] = idx
+        result = get_active_analysis(state)
+        bk_label = ""
+        if result:
+            _, _, bks, _ = result
+            if 0 <= idx < len(bks):
+                bk_label = f"  ({esc(bks[idx]['label'])})"
         await update.message.reply_text(
-            "\n".join([b("✅  Center Override Set"), SDIV, c(ov_str)]),
-            parse_mode=ParseMode.HTML)
+            f"{b('✅  Center Override Set')}\n{SDIV}\n"
+            f"{c(f'Bracket index {idx}{bk_label}')}",
+            parse_mode=ParseMode.HTML
+        )
     except Exception:
-        await update.message.reply_text("Usage:  " + c("/override 73"), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"Usage:  {c('/override [index]')}\nExample:  {c('/override 3')}",
+            parse_mode=ParseMode.HTML
+        )
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = update.effective_chat.id
+    cid   = update.effective_chat.id
     state = get_state(cid)
     state["mkt_prices"]      = {}
     state["center_override"] = None
     await update.message.reply_text(
-        "\n".join([b("✅  Reset Complete"), SDIV,
-                   c("Market prices cleared"),
-                   c("Center override cleared")]),
-        parse_mode=ParseMode.HTML)
+        f"{b('✅  Reset Complete')}\n{SDIV}\n"
+        f"{c('Market prices cleared')}\n"
+        f"{c('Center override cleared')}",
+        parse_mode=ParseMode.HTML
+    )
 
-
-# ── Callback handler ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACK HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q    = update.callback_query
+    q     = update.callback_query
     await q.answer()
-    cid  = q.message.chat_id
+    cid   = q.message.chat_id
     state = get_state(cid)
-    d    = q.data
+    d     = q.data
 
+    # ── Navigation ──────────────────────────────────────────────────────────
     if d == "back_main":
-        apt      = AIRPORTS[state["airport"]]
-        apt_row  = "{:5}  {}".format(apt["name"], apt["city"])
-        type_str = "High" if state["market_type"] == "high" else "Low"
-        type_row = "{:5}  Daily {}".format(type_str, type_str)
-        day_row  = "{:8}  Target".format(day_label(state["day_offset"]))
-        unit_row = "°{:4}  Unit".format(state["unit"])
-        text = "\n".join([
-            b("⛅  WeatherEdge"), DIV, "",
-            c(apt_row), c(type_row), c(day_row), c(unit_row),
-        ])
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
-
-    elif d == "menu_airport":
-        await q.edit_message_text(b("🏢  Select Airport") + "\n" + DIV,
-                                   parse_mode=ParseMode.HTML, reply_markup=kb_airports(state["airport"]))
-    elif d == "menu_day":
-        await q.edit_message_text(b("📅  Select Target Day") + "\n" + DIV,
-                                   parse_mode=ParseMode.HTML, reply_markup=kb_day(state["day_offset"]))
-    elif d == "menu_type":
-        await q.edit_message_text(b("🌡️  Select Market Type") + "\n" + DIV,
-                                   parse_mode=ParseMode.HTML, reply_markup=kb_type(state["market_type"]))
-    elif d == "menu_unit":
-        await q.edit_message_text(b("°  Select Temperature Unit") + "\n" + DIV,
-                                   parse_mode=ParseMode.HTML, reply_markup=kb_unit(state["unit"]))
-
-    elif d.startswith("set_airport_"):
-        state["airport"] = d[len("set_airport_"):]
-        apt = AIRPORTS[state["airport"]]
-        row = "{}  —  {}".format(apt["name"], apt["city"])
         await q.edit_message_text(
-            "\n".join([b("✅  Airport Updated"), SDIV, c(row)]),
-            parse_mode=ParseMode.HTML, reply_markup=kb_main())
+            f"{b('⛅  WeatherEdge')}\n{DIV}\n\n"
+            f"{c('Use the buttons below or type /markets to browse live markets')}",
+            parse_mode=ParseMode.HTML, reply_markup=kb_main()
+        )
 
-    elif d.startswith("set_day_"):
-        state["day_offset"] = int(d[len("set_day_"):])
+    elif d == "browse_markets":
         await q.edit_message_text(
-            "\n".join([b("✅  Target Day Updated"), SDIV, c(day_label(state["day_offset"]))]),
-            parse_mode=ParseMode.HTML, reply_markup=kb_main())
-
-    elif d.startswith("set_type_"):
-        state["market_type"] = d[len("set_type_"):]
-        type_str = "Daily High" if state["market_type"] == "high" else "Daily Low"
+            f"{b('⏳  Fetching markets…')}\n{SDIV}\n{it('Loading Polymarket temperature events…')}",
+            parse_mode=ParseMode.HTML
+        )
+        events = await asyncio.to_thread(fetch_poly_events)
+        state["cached_events"] = events
+        state["markets_page"]  = 0
         await q.edit_message_text(
-            "\n".join([b("✅  Market Type Updated"), SDIV, c(type_str)]),
-            parse_mode=ParseMode.HTML, reply_markup=kb_main())
+            msg_market_list(events, 0),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_market_list(events, 0)
+        )
 
-    elif d.startswith("set_unit_"):
-        state["unit"] = d[len("set_unit_"):]
+    elif d.startswith("market_page_"):
+        page   = int(d[len("market_page_"):])
+        events = state.get("cached_events") or []
+        state["markets_page"] = page
         await q.edit_message_text(
-            "\n".join([b("✅  Unit Updated"), SDIV, c("°" + state["unit"])]),
-            parse_mode=ParseMode.HTML, reply_markup=kb_main())
+            msg_market_list(events, page),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_market_list(events, page)
+        )
 
-    elif d == "fetch_all":
+    elif d.startswith("select_event_"):
+        slug   = d[len("select_event_"):]
+        events = state.get("cached_events") or []
+        ev     = next((e for e in events if e["slug"]==slug), None)
+        if not ev:
+            await q.answer("Market not found. Refresh markets.", show_alert=True)
+            return
+        city = CITY_DB.get(ev["city_key"])
+        if not city:
+            await q.edit_message_text(
+                f"{b('⚠️  City Not in Database')}\n{DIV}\n\n"
+                f"City key {c(esc(ev['city_key']))} has no station mapping.\n"
+                f"Cannot fetch weather data.",
+                parse_mode=ParseMode.HTML, reply_markup=kb_back()
+            )
+            return
+
+        # Set active market
+        state["active"] = {
+            "city_key":        ev["city_key"],
+            "market_type":     ev["market_type"],
+            "target_date":     ev["target_date"],
+            "brackets":        ev["brackets"],
+            "event_slug":      slug,
+            "event_volume":    ev["volume"],
+            "event_liquidity": ev["liquidity"],
+        }
+        state["data"] = {"hrrr":None,"ecmwf":None,"ow":None,"metar":None}
+        state["mkt_prices"]      = {}
+        state["center_override"] = None
+
+        typ = "High 🌡" if ev["market_type"]=="highest" else "Low ❄️"
         await q.edit_message_text(
-            "\n".join([b("⏳  Fetching data…"), SDIV,
-                       it("HRRR · ECMWF · METAR · OpenWeather · Polymarket")]),
-            parse_mode=ParseMode.HTML)
-        status = await asyncio.to_thread(fetch_all, state)
-        sl = "  ".join("{} {}".format(k, v) for k, v in status.items())
-        text = "{}\n\n{}\n{}".format(msg_forecast(state), SDIV, it(sl))
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_forecast())
+            f"{b('⏳  Fetching weather data…')}\n{DIV}\n"
+            f"{city['flag']}  {b(esc(city['display']))}  ·  Daily {typ}\n"
+            f"📍  {esc(city['station'])} ({city['metar']})\n"
+            f"📅  {day_label(ev['target_date'])}\n\n"
+            f"{it('ECMWF ensemble · HRRR/GFS · METAR · OpenWeather')}",
+            parse_mode=ParseMode.HTML
+        )
+        await run_fetch_and_reply(q.message, state, city)
 
-    elif d == "show_forecast":
-        await q.edit_message_text(msg_forecast(state), parse_mode=ParseMode.HTML, reply_markup=kb_forecast())
-
-    elif d == "show_markets":
-        await q.edit_message_text(msg_markets(state), parse_mode=ParseMode.HTML, reply_markup=kb_back())
+    elif d == "refresh_analysis":
+        active = state.get("active")
+        if not active:
+            await q.answer("No market selected.", show_alert=True)
+            return
+        city = CITY_DB.get(active["city_key"])
+        if not city:
+            await q.answer("City not in database.", show_alert=True)
+            return
+        await q.edit_message_text(
+            f"{b('⏳  Refreshing…')}\n{SDIV}\n{it('ECMWF  ·  HRRR  ·  METAR  ·  OpenWeather')}",
+            parse_mode=ParseMode.HTML
+        )
+        await run_fetch_and_reply(q.message, state, city)
 
     elif d == "show_strategy":
-        await q.edit_message_text(msg_strategy(state), parse_mode=ParseMode.HTML, reply_markup=kb_back())
+        result = get_active_analysis(state)
+        if not result:
+            await q.edit_message_text(
+                f"{b('❌  No Data')}\n\nFetch a market first.",
+                parse_mode=ParseMode.HTML, reply_markup=kb_back()
+            )
+            return
+        city, con, bks, ctr = result
+        await q.edit_message_text(
+            msg_strategy(state, city, bks, ctr, con),
+            parse_mode=ParseMode.HTML, reply_markup=kb_back()
+        )
 
     elif d == "run_ai":
+        result = get_active_analysis(state)
+        if not result:
+            await q.edit_message_text(
+                f"{b('❌  No Data')}\n\nFetch a market first.",
+                parse_mode=ParseMode.HTML, reply_markup=kb_back()
+            )
+            return
         await q.edit_message_text(
-            "\n".join([b("🤖  Running AI Analysis…"), SDIV, it("Synthesizing forecast data…")]),
-            parse_mode=ParseMode.HTML)
-        result = await asyncio.to_thread(msg_ai, state)
-        await q.edit_message_text(result, parse_mode=ParseMode.HTML, reply_markup=kb_back())
+            f"{b('🤖  Running AI Analysis…')}\n{SDIV}\n{it('Synthesising forecast data…')}",
+            parse_mode=ParseMode.HTML
+        )
+        city, con, bks, ctr = result
+        res = await asyncio.to_thread(msg_ai, state, city, con, bks, ctr)
+        await q.edit_message_text(res, parse_mode=ParseMode.HTML, reply_markup=kb_back())
 
     elif d == "send_chart":
-        con = build_consensus(state)
-        if not con:
-            await q.answer("No data yet — fetch first", show_alert=True); return
-        dist = build_dist(state, con)
-        if not dist:
-            await q.answer("No ECMWF data for chart", show_alert=True); return
-        apt = AIRPORTS[state["airport"]]
-        pos = get_pos(state, con)
-        buf = await asyncio.to_thread(make_chart, dist, pos, state["unit"],
-                                      apt["name"], apt["city"], con["confidence"], state["market_type"])
-        caption = ("ECMWF Ensemble  ·  {} {}  ·  Daily {}\n"
-                   "{}  ·  {:.1f}°{}  ·  Confidence {:.0f}/100").format(
-                   apt["name"], apt["city"],
-                   "High" if state["market_type"] == "high" else "Low",
-                   day_label(state["day_offset"]), con["temp"], state["unit"], con["confidence"])
-        await q.message.reply_photo(photo=buf, caption=caption)
+        result = get_active_analysis(state)
+        if not result:
+            await q.answer("No data yet — select and fetch a market first.", show_alert=True)
+            return
+        city, con, bks, ctr = result
+        if not bks:
+            await q.answer("No bracket data available.", show_alert=True)
+            return
+        active = state["active"]
+        buf = await asyncio.to_thread(
+            make_chart, bks, ctr,
+            city["display"], active["market_type"], city["unit"], con["confidence"]
+        )
+        cap = (
+            f"ECMWF Ensemble  ·  {city['display']} Daily "
+            f"{'High' if active['market_type']=='highest' else 'Low'}"
+            f"\n{day_label(active['target_date'])}  ·  "
+            f"Consensus {con['temp']:.1f}°{city['unit']}  ·  {con['confidence']:.0f}/100 conf"
+        )
+        await q.message.reply_photo(photo=buf, caption=cap)
 
+    elif d == "show_settings":
+        b_str  = "${:.2f}".format(state["budget"])
+        pl_str = "${:.2f}".format(state["budget"]/3)
+        sl_str = "{}%".format(state["stop_loss"])
+        text = "\n".join([
+            b("⚙️  Settings"), DIV, "",
+            "Budget:     " + b(b_str),
+            "Per bracket:" + b(pl_str),
+            "Stop loss:  " + b(sl_str),
+            "",
+            "Use " + c("/budget [amount]") + " and " + c("/stoploss [%]") + " to update.",
+        ])
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back())
 
-# ── Main ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
-        raise SystemExit("ERROR: TELEGRAM_TOKEN is not set in your .env file")
+        raise SystemExit("ERROR: TELEGRAM_TOKEN not set in .env")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     for cmd, handler in [
         ("start",    cmd_start),
         ("help",     cmd_help),
-        ("fetch",    cmd_fetch),
-        ("forecast", cmd_forecast),
-        ("chart",    cmd_chart),
         ("markets",  cmd_markets),
+        ("refresh",  cmd_refresh),
+        ("chart",    cmd_chart),
         ("strategy", cmd_strategy),
         ("analyze",  cmd_analyze),
         ("price",    cmd_price),
@@ -1061,12 +1451,14 @@ def main():
         app.add_handler(CommandHandler(cmd, handler))
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    print("⛅  WeatherEdge bot started")
-    print("   Telegram:     set" if TELEGRAM_TOKEN else "   Telegram:     MISSING")
-    print("   OpenWeather:  set" if OW_KEY else "   OpenWeather:  not set (optional)")
-    print("   Anthropic AI: set" if ANTHROPIC_KEY else "   Anthropic AI: not set (optional)")
+    confirmed = sum(1 for v in CITY_DB.values() if v["ok"])
+    total     = len(CITY_DB)
+    print(f"⛅  WeatherEdge v3 started")
+    print(f"   City database:  {confirmed} confirmed + {total-confirmed} inferred  ({total} total)")
+    print(f"   Telegram:       {'set' if TELEGRAM_TOKEN else 'MISSING'}")
+    print(f"   OpenWeather:    {'set' if OW_KEY else 'not set (optional)'}")
+    print(f"   Anthropic AI:   {'set' if ANTHROPIC_KEY else 'not set (optional)'}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
